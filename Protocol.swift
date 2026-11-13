@@ -3,8 +3,7 @@ import Network
 import Security
 import Darwin
 import CoreGraphics
-import ImageIO
-import AppKit
+import CoreMedia
 
 enum WireError: Error { case invalid }
 struct ConnectionCode: Codable {
@@ -90,8 +89,6 @@ final class Peer {
     var ready = false
     var closed = false
     var lastReceive = Date()
-    var sendingFrame = false
-    var latestFrame: Data?
     var pendingControl = 0
     init(_ connection: NWConnection) { self.connection = connection }
     func start() {
@@ -128,19 +125,17 @@ final class Peer {
             if error != nil { self.close() }
         })
     }
-    func frame(_ data: Data) {
+    // Every encoded frame must arrive or the H.264 reference chain breaks, so frames are never
+    // coalesced here. The host limits how many frames are in flight before encoding instead.
+    func frame(_ data: Data, sent: @escaping () -> Void) {
         guard ready, !closed else { return }
-        if sendingFrame { latestFrame = data; return }
-        sendingFrame = true
         connection.send(content: PacketParser.frame(data), completion: .contentProcessed { [weak self] error in
-            guard let self = self, !self.closed else { return }
-            self.sendingFrame = false
-            if error != nil { self.close(); return }
-            if let next = self.latestFrame { self.latestFrame = nil; self.frame(next) }
+            sent()
+            if error != nil { self?.close() }
         })
     }
     func close() {
-        guard !closed else { return }; closed = true; ready = false; latestFrame = nil
+        guard !closed else { return }; closed = true; ready = false
         connection.cancel(); onClose?(); onClose = nil
     }
 }
@@ -164,15 +159,91 @@ func localAddresses() -> [(String, String)] {
     return result
 }
 
-func boundedImage(_ data: Data) -> NSImage? {
-    guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
-          CGImageSourceGetCount(source) == 1,
-          CGImageSourceGetType(source) as String? == "public.jpeg",
-          let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-          let width = properties[kCGImagePropertyPixelWidth] as? Int,
-          let height = properties[kCGImagePropertyPixelHeight] as? Int,
-          width > 0, width <= 1440, height > 0, height <= 900,
-          let image = NSImage(data: data) else { return nil }
-    image.size = NSSize(width: width, height: height)
-    return image
+// Message type 4: [4][flags: 1 = keyframe][keyframe only: UInt16 BE length + SPS, UInt16 BE length + PPS]
+// [one access unit as AVCC NAL units, each prefixed by a UInt32 BE length].
+struct VideoFrame: Equatable {
+    var keyframe: Bool
+    var parameterSets: [Data]
+    var avcc: Data
+    var message: Data {
+        var data = Data([4, keyframe ? 1 : 0])
+        for p in parameterSets { data += [UInt8(p.count >> 8), UInt8(p.count & 0xff)] + p }
+        return data + avcc
+    }
+    static func parse(_ data: Data) throws -> VideoFrame {
+        let b = [UInt8](data)
+        guard b.count >= 7, b.count <= PacketParser.limit, b[0] == 4, b[1] <= 1 else { throw WireError.invalid }
+        var i = 2
+        var parameterSets = [Data]()
+        if b[1] == 1 {
+            for type: UInt8 in [7, 8] {
+                guard i + 2 <= b.count else { throw WireError.invalid }
+                let n = Int(b[i]) << 8 | Int(b[i + 1]); i += 2
+                guard n > 0, n <= 1024, n <= b.count - i, b[i] & 0x1f == type else { throw WireError.invalid }
+                parameterSets.append(Data(b[i..<i + n])); i += n
+            }
+        }
+        let start = i
+        var units = 0
+        guard i < b.count else { throw WireError.invalid }
+        while i < b.count {
+            guard i + 4 <= b.count else { throw WireError.invalid }
+            let n = b[i..<i + 4].reduce(0) { ($0 << 8) | Int($1) }; i += 4
+            units += 1
+            guard n > 0, n <= b.count - i, units <= 256 else { throw WireError.invalid }
+            i += n
+        }
+        return VideoFrame(keyframe: b[1] == 1, parameterSets: parameterSets, avcc: Data(b[start...]))
+    }
+}
+// Encoder output -> wire message. Returns nil for anything the viewer parser would reject.
+func videoMessage(_ sample: CMSampleBuffer) -> Data? {
+    guard let block = CMSampleBufferGetDataBuffer(sample), let format = CMSampleBufferGetFormatDescription(sample) else { return nil }
+    let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[CFString: Any]]
+    let keyframe = attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool != true
+    var count = 0
+    var headerLength: Int32 = 0
+    guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: 0, parameterSetPointerOut: nil, parameterSetSizeOut: nil, parameterSetCountOut: &count, nalUnitHeaderLengthOut: &headerLength) == noErr, headerLength == 4 else { return nil }
+    var parameterSets = [Data]()
+    if keyframe {
+        guard count == 2 else { return nil }
+        for index in 0..<count {
+            var pointer: UnsafePointer<UInt8>?
+            var size = 0
+            guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: index, parameterSetPointerOut: &pointer, parameterSetSizeOut: &size, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil) == noErr, let pointer else { return nil }
+            parameterSets.append(Data(bytes: pointer, count: size))
+        }
+    }
+    let length = CMBlockBufferGetDataLength(block)
+    guard length > 0, length <= PacketParser.limit else { return nil }
+    var avcc = Data(count: length)
+    guard avcc.withUnsafeMutableBytes({ CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!) }) == noErr else { return nil }
+    let message = VideoFrame(keyframe: keyframe, parameterSets: parameterSets, avcc: avcc).message
+    return (try? VideoFrame.parse(message)) == nil ? nil : message
+}
+// Validates dimensions from the SPS before anything is decoded.
+func videoFormat(_ frame: VideoFrame) -> CMVideoFormatDescription? {
+    guard frame.parameterSets.count == 2 else { return nil }
+    let sps = frame.parameterSets[0], pps = frame.parameterSets[1]
+    var format: CMFormatDescription?
+    let status = sps.withUnsafeBytes { s in pps.withUnsafeBytes { p in
+        CMVideoFormatDescriptionCreateFromH264ParameterSets(allocator: kCFAllocatorDefault, parameterSetCount: 2, parameterSetPointers: [s.bindMemory(to: UInt8.self).baseAddress!, p.bindMemory(to: UInt8.self).baseAddress!], parameterSetSizes: [sps.count, pps.count], nalUnitHeaderLength: 4, formatDescriptionOut: &format)
+    } }
+    guard status == noErr, let format else { return nil }
+    let size = CMVideoFormatDescriptionGetDimensions(format)
+    guard size.width >= 2, size.width <= 1920, size.height >= 2, size.height <= 1200 else { return nil }
+    return format
+}
+func videoSample(_ frame: VideoFrame, format: CMVideoFormatDescription) -> CMSampleBuffer? {
+    var size = frame.avcc.count
+    var block: CMBlockBuffer?
+    guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: size, blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0, dataLength: size, flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &block) == noErr, let block,
+          frame.avcc.withUnsafeBytes({ CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block, offsetIntoDestination: 0, dataLength: size) }) == noErr else { return nil }
+    var sample: CMSampleBuffer?
+    guard CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: format, sampleCount: 1, sampleTimingEntryCount: 0, sampleTimingArray: nil, sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &sample) == noErr, let sample,
+          let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true) else { return nil }
+    let dict = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+    CFDictionarySetValue(dict, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(), Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+    if !frame.keyframe { CFDictionarySetValue(dict, Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(), Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()) }
+    return sample
 }

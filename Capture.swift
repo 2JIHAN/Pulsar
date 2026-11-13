@@ -1,30 +1,68 @@
 import AppKit
 import ScreenCaptureKit
-import CoreImage
+import VideoToolbox
 import ApplicationServices
 
+final class VideoEncoder {
+    private let session: VTCompressionSession
+    private let onOutput: (Data?) -> Void
+    // onOutput runs on a VideoToolbox thread with a wire message, or nil when the frame was dropped.
+    init(width: Int, height: Int, onOutput: @escaping (Data?) -> Void) throws {
+        var created: VTCompressionSession?
+        let spec = [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true] as CFDictionary
+        guard VTCompressionSessionCreate(allocator: nil, width: Int32(width), height: Int32(height), codecType: kCMVideoCodecType_H264, encoderSpecification: spec, imageBufferAttributes: nil, compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &created) == noErr, let session = created else { throw WireError.invalid }
+        self.session = session; self.onOutput = onOutput
+        let properties: [CFString: Any] = [
+            kVTCompressionPropertyKey_RealTime: true,
+            kVTCompressionPropertyKey_AllowFrameReordering: false,
+            kVTCompressionPropertyKey_ProfileLevel: kVTProfileLevel_H264_High_AutoLevel,
+            kVTCompressionPropertyKey_AverageBitRate: 6_000_000,
+            kVTCompressionPropertyKey_DataRateLimits: [1_125_000, 1], // bytes per second: 9 Mbps peak
+            kVTCompressionPropertyKey_ExpectedFrameRate: 30,
+            kVTCompressionPropertyKey_MaxKeyFrameInterval: 60,
+            kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 2,
+        ]
+        guard VTSessionSetProperties(session, propertyDictionary: properties as CFDictionary) == noErr, VTCompressionSessionPrepareToEncodeFrames(session) == noErr else { VTCompressionSessionInvalidate(session); throw WireError.invalid }
+    }
+    deinit { VTCompressionSessionInvalidate(session) }
+    func encode(_ pixel: CVImageBuffer, time: CMTime, keyframe: Bool) -> Bool {
+        let options = keyframe ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
+        return VTCompressionSessionEncodeFrame(session, imageBuffer: pixel, presentationTimeStamp: time, duration: .invalid, frameProperties: options, infoFlagsOut: nil) { [onOutput] status, _, sample in
+            onOutput(status == noErr ? sample.flatMap(videoMessage) : nil)
+        } == noErr
+    }
+}
 final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     var stream: SCStream?
-    var onFrame: ((Data) -> Void)?
+    // The completion must be called once the frame has been handed to the network.
+    var onFrame: ((Data, @escaping () -> Void) -> Void)?
     var onError: ((String) -> Void)?
     var rect = CGRect.zero
     var active = false
     private var stopped = false
     private let queue = DispatchQueue(label: "Pulsar.capture")
-    private let context = CIContext()
-    private let delivery = DispatchSemaphore(value: 1)
+    private var encoder: VideoEncoder?
+    // Owned by queue. Captured frames are skipped before encoding while two are in flight,
+    // because dropping an encoded frame would break the decoder's reference chain.
+    private var inFlight = 0
+    private var needsKeyframe = true
     @MainActor func start() async throws {
         guard !stopped else { throw WireError.invalid }
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard !stopped else { throw WireError.invalid }
         guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first else { throw WireError.invalid }
         rect = CGDisplayBounds(display.displayID)
+        let mode = CGDisplayCopyDisplayMode(display.displayID)
+        let width = Double(mode?.pixelWidth ?? display.width), height = Double(mode?.pixelHeight ?? display.height)
         let config = SCStreamConfiguration()
-        let scale = min(1, min(1440 / Double(display.width), 900 / Double(display.height)))
-        config.width = max(2, Int(Double(display.width) * scale) / 2 * 2)
-        config.height = max(2, Int(Double(display.height) * scale) / 2 * 2)
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 15)
+        let scale = min(1, min(1920 / width, 1200 / height))
+        config.width = max(2, Int(width * scale) / 2 * 2)
+        config.height = max(2, Int(height * scale) / 2 * 2)
+        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
         config.queueDepth = 3; config.showsCursor = true; config.capturesAudio = false
+        let encoder = try VideoEncoder(width: config.width, height: config.height) { [weak self] message in self?.deliver(message) }
+        queue.sync { self.encoder = encoder }
         let s = SCStream(filter: SCContentFilter(display: display, excludingWindows: []), configuration: config, delegate: self)
         try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         stream = s; active = true
@@ -43,13 +81,18 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         DispatchQueue.main.async { [weak self] in self?.onError?("화면 캡처가 중단되었습니다.") }
     }
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen, let pixel = CMSampleBufferGetImageBuffer(sampleBuffer), delivery.wait(timeout: .now()) == .success else { return }
-        guard let cg = context.createCGImage(CIImage(cvPixelBuffer: pixel), from: CGRect(x: 0, y: 0, width: CVPixelBufferGetWidth(pixel), height: CVPixelBufferGetHeight(pixel))),
-              let jpeg = NSBitmapImageRep(cgImage: cg).representation(using: .jpeg, properties: [.compressionFactor: 0.55]), jpeg.count + 1 <= PacketParser.limit else { delivery.signal(); return }
+        guard type == .screen, inFlight < 2, let encoder, let pixel = CMSampleBufferGetImageBuffer(sampleBuffer),
+              let info = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let status = info.first?[.status] as? Int, status == SCFrameStatus.complete.rawValue else { return }
+        inFlight += 1
+        if encoder.encode(pixel, time: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), keyframe: needsKeyframe) { needsKeyframe = false }
+        else { needsKeyframe = true; inFlight -= 1 }
+    }
+    private func deliver(_ message: Data?) {
+        guard let message else { queue.async { self.needsKeyframe = true; self.inFlight -= 1 }; return }
         DispatchQueue.main.async { [weak self] in
-            defer { self?.delivery.signal() }
-            guard let self = self, self.active else { return }
-            self.onFrame?(Data([1]) + jpeg)
+            guard let self, self.active, let onFrame = self.onFrame else { return }
+            onFrame(message) { self.queue.async { self.inFlight -= 1 } }
         }
     }
 }

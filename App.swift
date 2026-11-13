@@ -1,23 +1,47 @@
 import AppKit
 import Network
 import ApplicationServices
-import ImageIO
+import AVFoundation
 
 final class Viewer: NSView {
-    var image: NSImage? { didSet { needsDisplay = true } }
+    let display = AVSampleBufferDisplayLayer()
+    var format: CMVideoFormatDescription?
+    var videoSize = CGSize.zero { didSet { needsLayout = true; needsDisplay = true } }
     var sendInput: ((InputMessage) -> Void)?
     var emergency: (() -> Void)?
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { true }
     var contentRect: NSRect {
-        guard let size = image?.size, size.width > 0, size.height > 0 else { return .zero }
+        let size = videoSize
+        guard size.width > 0, size.height > 0 else { return .zero }
         let s = min(bounds.width / size.width, bounds.height / size.height)
         return NSRect(x: (bounds.width - size.width * s) / 2, y: (bounds.height - size.height * s) / 2, width: size.width * s, height: size.height * s)
     }
+    // Returns false for a frame that must close the connection. Non-keyframes without a usable
+    // decoder state are skipped until the next keyframe, which the host sends at least every 2 s.
+    func show(_ frame: VideoFrame) -> Bool {
+        let renderer = display.sampleBufferRenderer
+        if renderer.status == .failed { renderer.flush(); format = nil }
+        if frame.keyframe {
+            guard let next = videoFormat(frame) else { return false }
+            if format.map({ !CMFormatDescriptionEqual($0, otherFormatDescription: next) }) ?? true {
+                format = next
+                let d = CMVideoFormatDescriptionGetDimensions(next)
+                videoSize = CGSize(width: Int(d.width), height: Int(d.height))
+            }
+        }
+        if let format, let sample = videoSample(frame, format: format) { renderer.enqueue(sample) }
+        return true
+    }
+    func clear() { format = nil; videoSize = .zero; display.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil) }
+    override func layout() {
+        super.layout()
+        if display.superlayer == nil { wantsLayer = true; display.videoGravity = .resize; layer?.addSublayer(display) }
+        CATransaction.begin(); CATransaction.setDisableActions(true); display.frame = contentRect; CATransaction.commit()
+    }
     override func draw(_ dirtyRect: NSRect) {
         NSColor.black.setFill(); bounds.fill()
-        image?.draw(in: contentRect, from: .zero, operation: .copy, fraction: 1, respectFlipped: true, hints: nil)
-        if image == nil { ("연결 후 이 화면을 클릭하면 입력이 전달됩니다." as NSString).draw(at: NSPoint(x: 20, y: 20), withAttributes: [.foregroundColor: NSColor.white]) }
+        if videoSize == .zero { ("연결 후 이 화면을 클릭하면 입력이 전달됩니다." as NSString).draw(at: NSPoint(x: 20, y: 20), withAttributes: [.foregroundColor: NSColor.white]) }
     }
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -30,7 +54,14 @@ final class Viewer: NSView {
         let p = convert(e.locationInWindow, from: nil), r = contentRect
         guard r.width > 0, r.height > 0 else { return }
         if !r.contains(p) && kind != .up { return }
-        sendInput?(InputMessage(kind: kind, x: min(1, max(0, (p.x-r.minX)/r.width)), y: min(1, max(0, (p.y-r.minY)/r.height)), code: UInt16(min(2, e.buttonNumber)), flags: UInt64(e.modifierFlags.rawValue), dx: Double(e.scrollingDeltaX), dy: Double(e.scrollingDeltaY)))
+        sendInput?(Viewer.inputMessage(e, kind, point: p, rect: r))
+    }
+    // NSEvent raises if scrollingDelta is read from a non-scroll event, which crashed the viewer on the first click.
+    static func inputMessage(_ e: NSEvent, _ kind: InputMessage.Kind, point p: NSPoint, rect r: NSRect) -> InputMessage {
+        let scroll = kind == .scroll
+        return InputMessage(kind: kind, x: min(1, max(0, (p.x-r.minX)/r.width)), y: min(1, max(0, (p.y-r.minY)/r.height)),
+            code: scroll ? 0 : UInt16(min(2, max(0, e.buttonNumber))), flags: UInt64(e.modifierFlags.rawValue),
+            dx: scroll ? min(1000, max(-1000, Double(e.scrollingDeltaX))) : 0, dy: scroll ? min(1000, max(-1000, Double(e.scrollingDeltaY))) : 0)
     }
     override func mouseDown(with e: NSEvent) { window?.makeFirstResponder(self); mouse(e, .down) }
     override func mouseUp(with e: NSEvent) { mouse(e, .up) }
@@ -77,7 +108,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let mainMenu = NSMenu(); let item = NSMenuItem(); mainMenu.addItem(item)
         let menu = NSMenu(); menu.addItem(withTitle: "Pulsar 종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"); item.submenu = menu; NSApp.mainMenu = mainMenu
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 760), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "Pulsar 0.1.0"; window.delegate = self
+        window.title = "Pulsar 0.2.0"; window.delegate = self
         let root = NSStackView(); root.orientation = .vertical; root.alignment = .leading; root.spacing = 10; root.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
         root.translatesAutoresizingMaskIntoConstraints = false; window.contentView!.addSubview(root)
         NSLayoutConstraint.activate([root.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor), root.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor), root.topAnchor.constraint(equalTo: window.contentView!.topAnchor), root.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor)])
@@ -146,7 +177,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             for other in self.peers where other !== p { other.close() }
             self.status.stringValue = "암호화 연결됨. 화면 전송 중. 입력 허용은 체크박스로 제어합니다."
             let capture = Capture(); self.capture = capture
-            capture.onFrame = { [weak self, weak p, weak capture] data in guard let self = self, let capture = capture, self.active === p, self.capture === capture else { return }; p?.frame(data) }
+            capture.onFrame = { [weak self, weak p, weak capture] data, sent in guard let self = self, let capture = capture, self.active === p, self.capture === capture else { return }; p?.frame(data, sent: sent) }
             capture.onError = { [weak self, weak p] message in guard let self = self, self.active === p else { return }; p?.close(); self.status.stringValue = message }
             Task { @MainActor in
                 do { try await capture.start(); if self.active === p { self.injector.rect = capture.rect } else { capture.stop() } }
@@ -182,14 +213,13 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             p.onReady = { [weak self] in self?.status.stringValue = "암호화 연결됨. 화면을 클릭해 입력하세요. Command+Option+Escape는 긴급 중지입니다." }
             p.onPacket = { [weak self, weak p] data in
                 if data == Data([3]) { return }
-                guard data.first == 1, let image = boundedImage(Data(data.dropFirst())) else { p?.close(); return }
-                self?.viewer.image = image
+                guard let self = self, let frame = try? VideoFrame.parse(data), self.viewer.show(frame) else { p?.close(); return }
             }
-            p.onClose = { [weak self, weak p] in guard let self = self, self.outbound === p else { return }; self.outbound = nil; self.viewer.image = nil; self.status.stringValue = "연결 종료. 코드, 네트워크와 Tailscale 상태를 확인하세요. 잘못된 비밀키도 거부됩니다." }
+            p.onClose = { [weak self, weak p] in guard let self = self, self.outbound === p else { return }; self.outbound = nil; self.viewer.clear(); self.status.stringValue = "연결 종료. 코드, 네트워크와 Tailscale 상태를 확인하세요. 잘못된 비밀키도 거부됩니다." }
             p.start()
         } catch { status.stringValue = "유효하지 않은 연결코드입니다." }
     }
-    @objc func disconnectViewer() { outbound?.close(); outbound = nil; viewer.image = nil }
+    @objc func disconnectViewer() { outbound?.close(); outbound = nil; viewer.clear() }
     func stopHost() {
         hosting = false; listener?.cancel(); listener = nil
         for p in peers { p.close() }; peers.removeAll(); active = nil
