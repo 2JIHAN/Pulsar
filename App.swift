@@ -4,11 +4,22 @@ import ApplicationServices
 import AVFoundation
 import Carbon
 
+@_silgen_name("CGSMainConnectionID") private func CGSMainConnectionID() -> Int32
+@_silgen_name("CGSSetGlobalHotKeyOperatingMode") private func CGSSetGlobalHotKeyOperatingMode(_ cid: Int32, _ mode: Int32) -> Int32
+
 // Disabling symbolic hot keys lets Cmd+Tab, Cmd+Space and Mission Control keys reach the viewer.
+// Carbon's push alone did not stop Ctrl+Up on a real MacBook; Parsec's loader also imports this
+// CoreGraphics call (REA evidence). Mode 1 disables global hot keys, 0 restores them.
 // Each push must be popped exactly once, otherwise the user's shortcuts stay disabled.
 final class HotKeyMode {
-    var push: () -> UnsafeMutableRawPointer? = { PushSymbolicHotKeyMode(OptionBits(kHIHotKeyModeAllDisabled)) }
-    var pop: (UnsafeMutableRawPointer) -> Void = { PopSymbolicHotKeyMode($0) }
+    var push: () -> UnsafeMutableRawPointer? = {
+        _ = CGSSetGlobalHotKeyOperatingMode(CGSMainConnectionID(), 1)
+        return PushSymbolicHotKeyMode(OptionBits(kHIHotKeyModeAllDisabled))
+    }
+    var pop: (UnsafeMutableRawPointer) -> Void = {
+        PopSymbolicHotKeyMode($0)
+        _ = CGSSetGlobalHotKeyOperatingMode(CGSMainConnectionID(), 0)
+    }
     private var token: UnsafeMutableRawPointer?
     func set(_ on: Bool) {
         if on, token == nil { token = push() }
@@ -145,7 +156,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         edit.addItem(withTitle: "전체 선택", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         NSApp.mainMenu = mainMenu
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 760), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "Pulsar 0.3.0"; window.delegate = self
+        window.title = "Pulsar 0.3.1"; window.delegate = self
         let root = NSStackView(); root.orientation = .vertical; root.alignment = .leading; root.spacing = 10; root.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
         root.translatesAutoresizingMaskIntoConstraints = false; window.contentView!.addSubview(root)
         NSLayoutConstraint.activate([root.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor), root.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor), root.topAnchor.constraint(equalTo: window.contentView!.topAnchor), root.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor)])
@@ -274,7 +285,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         p.onReady = { [weak self] in
             guard let self else { return }
             self.session.connected()
-            self.status.stringValue = "암호화 연결됨. 화면을 클릭해 입력하세요. Command+Option+Escape는 긴급 중지입니다." + (AXIsProcessTrusted() ? "" : " 시스템 단축키 전달에는 이 Mac의 손쉬운 사용 권한이 필요합니다.")
+            self.status.stringValue = "암호화 연결됨. 화면을 클릭해 입력하세요. Command+Option+Escape는 긴급 중지입니다." + (AXIsProcessTrusted() ? "" : " 시스템 단축키와 제스처 전달에는 이 Mac의 손쉬운 사용과 입력 모니터링 권한이 필요합니다.")
             self.updateHotKeys()
         }
         p.onPacket = { [weak self, weak p] data in
