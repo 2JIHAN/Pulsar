@@ -1,0 +1,7 @@
+build/
+release/
+ANALYSIS.md
+rea-evidence.json
+VERIFICATION.md
+AUTOCLEAN-VERIFICATION.md
+.DS_Store
