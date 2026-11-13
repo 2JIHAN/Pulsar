@@ -1,4 +1,4 @@
-# Pulsar 0.3.1
+# Pulsar 0.3.2
 
 두 Mac 사이에서 기본 디스플레이 화면을 보고 마우스와 키보드를 제어하는 독립 macOS 앱입니다. 기존 ThunderControl과 Parsec의 설정이나 세션을 사용하지 않습니다. macOS 14 이상과 Apple Silicon이 필요합니다.
 
@@ -59,3 +59,7 @@ open build/Pulsar.app
 
 - Ctrl+위 화살표(Mission Control) 같은 시스템 단축키가 뷰어 Mac에서 먼저 실행되던 문제를 고쳤습니다. Parsec과 같은 방식으로 뷰어에 초점이 있는 동안 시스템 단축키를 끕니다.
 - 뷰어 Mac에는 손쉬운 사용과 입력 모니터링 권한이 필요합니다.
+
+## 0.3.2 변경 사항
+
+- Pulsar > 환경설정(Command+,)에서 화면 기록, 손쉬운 사용, 입력 모니터링 권한의 허용 여부를 확인하고 각 설정 화면을 바로 열 수 있습니다.

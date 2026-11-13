@@ -136,6 +136,8 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var outbound: Peer?
     var session = ViewerSession()
     let hotKeys = HotKeyMode()
+    let permissionsWindow = PermissionsWindow()
+    @objc func showPermissions() { permissionsWindow.show() }
     var gestureNoted = false
     var capture: Capture?
     let injector = InputInjector()
@@ -145,7 +147,10 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         let mainMenu = NSMenu(); let item = NSMenuItem(); mainMenu.addItem(item)
-        let menu = NSMenu(); menu.addItem(withTitle: "Pulsar 종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"); item.submenu = menu
+        let menu = NSMenu()
+        menu.addItem(withTitle: "환경설정…", action: #selector(showPermissions), keyEquivalent: ",").target = self
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Pulsar 종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"); item.submenu = menu
         let edit = NSMenu(title: "편집"), editItem = NSMenuItem(); editItem.submenu = edit; mainMenu.addItem(editItem)
         edit.addItem(withTitle: "실행 취소", action: Selector(("undo:")), keyEquivalent: "z")
         edit.addItem(withTitle: "실행 복귀", action: Selector(("redo:")), keyEquivalent: "Z")
@@ -156,7 +161,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         edit.addItem(withTitle: "전체 선택", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         NSApp.mainMenu = mainMenu
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 760), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "Pulsar 0.3.1"; window.delegate = self
+        window.title = "Pulsar 0.3.2"; window.delegate = self
         let root = NSStackView(); root.orientation = .vertical; root.alignment = .leading; root.spacing = 10; root.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
         root.translatesAutoresizingMaskIntoConstraints = false; window.contentView!.addSubview(root)
         NSLayoutConstraint.activate([root.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor), root.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor), root.topAnchor.constraint(equalTo: window.contentView!.topAnchor), root.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor)])
@@ -216,14 +221,14 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if allow.state == .on && !AXIsProcessTrusted() {
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
             _ = AXIsProcessTrustedWithOptions(options)
-            allow.state = .off; status.stringValue = "시스템 설정 > 개인정보 보호 및 보안 > 손쉬운 사용에서 Pulsar을 허용한 뒤 다시 체크하세요."
+            allow.state = .off; status.stringValue = "손쉬운 사용 권한이 필요합니다. Pulsar > 환경설정(Command+,)에서 설정을 열어 허용한 뒤 다시 체크하세요."
         }
         if allow.state == .off { injector.release() }
     }
     @objc func toggleHost() {
         if hosting { stopHost(); return }
         disconnectViewer()
-        guard CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() else { status.stringValue = "화면 기록 권한이 필요합니다. 시스템 설정에서 Pulsar을 허용한 뒤 앱을 다시 여세요."; return }
+        guard CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() else { status.stringValue = "화면 기록 권한이 필요합니다. Pulsar > 환경설정(Command+,)에서 허용한 뒤 앱을 다시 여세요."; return }
         do {
             let t = try ConnectionCode.randomToken(); token = t
             let c = ConnectionCode(host: "localhost", port: 1, token: t); secret = c.secret
@@ -321,6 +326,6 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         allow.state = .off; hostButton.title = "호스트 시작"; status.stringValue = "호스트가 중지되었습니다."
     }
     @objc func stopAll() { stopHost(); disconnectViewer(); status.stringValue = "모든 연결을 중지했습니다. 새 호스트 세션은 새 비밀키를 만듭니다." }
-    func windowWillClose(_ notification: Notification) { NSApp.terminate(nil) }
+    func windowWillClose(_ notification: Notification) { if (notification.object as? NSWindow) === window { NSApp.terminate(nil) } }
     func applicationWillTerminate(_ notification: Notification) { stopAll(); timer?.invalidate() }
 }
