@@ -161,7 +161,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         edit.addItem(withTitle: "전체 선택", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         NSApp.mainMenu = mainMenu
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 760), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "Pulsar 0.3.3"; window.delegate = self
+        window.title = "Pulsar 0.3.4"; window.delegate = self
         let root = NSStackView(); root.orientation = .vertical; root.alignment = .leading; root.spacing = 10; root.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
         root.translatesAutoresizingMaskIntoConstraints = false; window.contentView!.addSubview(root)
         NSLayoutConstraint.activate([root.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor), root.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor), root.topAnchor.constraint(equalTo: window.contentView!.topAnchor), root.bottomAnchor.constraint(equalTo: window.contentView!.bottomAnchor)])
@@ -221,7 +221,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if allow.state == .on && !AXIsProcessTrusted() {
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
             _ = AXIsProcessTrustedWithOptions(options)
-            allow.state = .off; status.stringValue = "손쉬운 사용 권한이 필요합니다. Pulsar > 환경설정(Command+,)에서 설정을 열어 허용한 뒤 다시 체크하세요."
+            allow.state = .off; status.stringValue = "기기 제어 및 데이터 접근 권한이 필요합니다. Pulsar > 환경설정(Command+,)에서 설정을 열어 허용한 뒤 다시 체크하세요."
         }
         if allow.state == .off { injector.release() }
     }
@@ -290,7 +290,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         p.onReady = { [weak self] in
             guard let self else { return }
             self.session.connected()
-            self.status.stringValue = "암호화 연결됨. 화면을 클릭해 입력하세요. Command+Option+Escape는 긴급 중지입니다." + (AXIsProcessTrusted() ? "" : " 시스템 단축키와 제스처 전달에는 이 Mac의 손쉬운 사용과 입력 모니터링 권한이 필요합니다.")
+            self.status.stringValue = "암호화 연결됨. 화면을 클릭해 입력하세요. Command+Option+Escape는 긴급 중지입니다." + (AXIsProcessTrusted() ? "" : " 시스템 단축키와 제스처 전달에는 이 Mac의 기기 제어 및 데이터 접근과 입력 모니터링 권한이 필요합니다.")
             self.updateHotKeys()
         }
         p.onPacket = { [weak self, weak p] data in
