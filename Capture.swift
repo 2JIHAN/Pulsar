@@ -107,6 +107,8 @@ final class InputInjector {
     func apply(_ m: InputMessage) {
         guard m.valid else { return }
         if m.kind == .release { release(); return }
+        // Gesture streams left open by a disconnect are not ended synthetically.
+        if m.kind == .gesture { post(gestureEvent(m, hostBuild: osBuild, rect: rect)); return }
         guard let point = normalizedPoint(x: m.x, y: m.y, rect: rect) else { return }
         let flags = CGEventFlags(rawValue: m.flags & 0x00ff0000)
         var event: CGEvent?
@@ -132,7 +134,7 @@ final class InputInjector {
             let masks: [UInt16: CGEventFlags] = [54: .maskCommand, 55: .maskCommand, 56: .maskShift, 60: .maskShift, 58: .maskAlternate, 61: .maskAlternate, 59: .maskControl, 62: .maskControl, 63: .maskSecondaryFn]
             if let mask = masks[m.code], flags.contains(mask) { modifiers.insert(m.code) } else { modifiers.remove(m.code) }
             event = CGEvent(keyboardEventSource: nil, virtualKey: m.code, keyDown: false); event?.type = .flagsChanged
-        case .release: break
+        case .release, .gesture: break
         }
         event?.flags = flags; post(event)
     }

@@ -52,6 +52,15 @@ func runSelfTests() {
         injector.release(); precondition(posted == 6 && injector.modifiers.isEmpty && injector.keys.isEmpty && injector.buttons.isEmpty)
         injector.release(); precondition(posted == 6)
         print("PASS empty release no-op, held key/button/modifier cleanup with nonposting event sink")
+        try gestureTests(injector: injector)
+        sessionTests(decoded)
+        var pushes = 0, pops = [UnsafeMutableRawPointer]()
+        let hotToken = UnsafeMutableRawPointer(bitPattern: 0x1234)!
+        let hot = HotKeyMode(); hot.push = { pushes += 1; return hotToken }; hot.pop = { pops.append($0) }
+        hot.set(false); hot.set(true); hot.set(true); hot.set(false); hot.set(false)
+        precondition(pushes == 1 && pops == [hotToken])
+        hot.set(true); hot.set(false); precondition(pushes == 2 && pops.count == 2)
+        print("PASS symbolic hot key mode push/pop balanced with the pushed token, no double pop")
         let test = TLSTest(secret: decoded.secret); test.start(); dispatchMain()
     } catch { print("FAIL pure protocol tests"); exit(1) }
 }
@@ -63,6 +72,7 @@ final class TLSTest {
     var wrong: Peer?
     var phase = 0
     var success = false
+    var replacement: HostReplacementTest?
     init(secret: Data) { self.secret = secret }
     func start() {
         do { listener = try NWListener(using: tlsParameters(secret: secret), on: .any) }
@@ -95,7 +105,13 @@ final class TLSTest {
                     let bad = Peer(NWConnection(host: "127.0.0.1", port: self.listener.port!, using: tlsParameters(secret: Data(repeating: 0, count: 32))))
                     self.wrong = bad
                     bad.onReady = { print("FAIL wrong key authenticated"); exit(1) }
-                    bad.onClose = { guard bad.failure != nil else { print("FAIL wrong key closed without TLS rejection state=\(bad.connection.state)"); exit(1) }; print("PASS wrong TLS key rejected before application data"); print("SELF-TEST PASS"); exit(0) }
+                    bad.onClose = {
+                        guard bad.failure != nil else { print("FAIL wrong key closed without TLS rejection state=\(bad.connection.state)"); exit(1) }
+                        var session = ViewerSession(); session.start(try! ConnectionCode.parse(ConnectionCode(host: "127.0.0.1", port: 1, token: try! ConnectionCode.randomToken()).text))
+                        guard session.closed(failure: bad.failure) == .wrongCode else { print("FAIL wrong key not classified as wrong code: \(String(describing: bad.failure))"); exit(1) }
+                        print("PASS wrong TLS key rejected before application data and stops reconnecting (\(bad.failure!))")
+                        self.replacement = HostReplacementTest(secret: self.secret); self.replacement!.start()
+                    }
                     bad.start()
                 }
                 p.start()
@@ -170,4 +186,87 @@ func videoTests() throws {
     for (i, message) in bad.enumerated() where (try? VideoFrame.parse(message)) != nil { print("FAIL malformed video message \(i) accepted"); exit(1) }
     precondition((try? VideoFrame.parse(Data([4, 0] + Array(repeating: unit, count: 256).joined()))) != nil)
     print("PASS oversized H.264 dimensions and \(bad.count) malformed video messages rejected")
+}
+final class HostReplacementTest {
+    let secret: Data
+    let host = HostPeers()
+    var listener: NWListener!
+    var first: Peer?
+    var second: Peer?
+    var events = [String]()
+    var firstClosed = false
+    init(secret: Data) { self.secret = secret }
+    func client() -> Peer { Peer(NWConnection(host: "127.0.0.1", port: listener.port!, using: tlsParameters(secret: secret))) }
+    func start() {
+        do { listener = try NWListener(using: tlsParameters(secret: secret), on: .any) } catch { print("FAIL replacement listener"); exit(1) }
+        listener.newConnectionHandler = { [host] c in host.accept(c) }
+        host.onInactive = { self.events.append("inactive") }
+        host.onActive = { p in
+            self.events.append("active")
+            if self.events == ["active"] {
+                let s = self.client(); self.second = s
+                s.onClose = { print("FAIL replacing client closed"); exit(1) }
+                s.start()
+            }
+            self.check()
+        }
+        listener.stateUpdateHandler = { state in
+            guard case .ready = state else { return }
+            let f = self.client(); self.first = f
+            f.onClose = { self.firstClosed = true; self.check() }
+            f.start()
+        }
+        listener.start(queue: .main)
+    }
+    func check() {
+        guard firstClosed, events == ["active", "inactive", "active"] else { return }
+        guard host.peers.count == 1, host.active === host.peers.first, host.active?.ready == true, second?.ready == true else { print("FAIL host replacement state"); exit(1) }
+        print("PASS host accepts a second authenticated viewer, closes the first and keeps one active peer")
+        print("SELF-TEST PASS"); exit(0)
+    }
+}
+func gestureFixture(_ subtype: Int64, phase: Int64, scalar: Double) -> CGEvent {
+    let event = CGEvent(source: nil)!
+    event.type = CGEventType(rawValue: 29)!
+    event.setIntegerValueField(CGEventField(rawValue: 110)!, value: subtype)
+    event.setIntegerValueField(CGEventField(rawValue: 132)!, value: phase)
+    event.setDoubleValueField(CGEventField(rawValue: 113)!, value: scalar)
+    return event
+}
+func gestureTests(injector: InputInjector) throws {
+    let build = osBuild!
+    let viewRect = NSRect(x: 10, y: 20, width: 200, height: 100), hostRect = CGRect(x: 0, y: 0, width: 1441, height: 901)
+    let pinch = Viewer.gestureMessage(NSEvent(cgEvent: gestureFixture(8, phase: 2, scalar: 0.25))!, point: NSPoint(x: 110, y: 70), rect: viewRect)!
+    let wire = try JSONEncoder().encode(pinch)
+    let m = try JSONDecoder().decode(InputMessage.self, from: wire)
+    precondition(wire.count + 1 <= 100_000 && m.valid && m.kind == .gesture && m.build == build && m.x == 0.5 && m.y == 0.5)
+    let event = gestureEvent(m, hostBuild: build, rect: hostRect)!
+    precondition(event.type.rawValue == 29 && event.getIntegerValueField(CGEventField(rawValue: 110)!) == 8
+        && event.getIntegerValueField(CGEventField(rawValue: 132)!) == 2 && event.getDoubleValueField(CGEventField(rawValue: 113)!) == 0.25
+        && event.location == CGPoint(x: 720, y: 450) && NativeGestureDescriptor.decode(event) == NativeGestureDescriptor(kind: .pinch, phase: .changed))
+    var posted = [CGEvent](); injector.postEvent = { posted.append($0) }; injector.rect = hostRect
+    injector.apply(m); precondition(posted.count == 1 && posted[0].type.rawValue == 29 && posted[0].location == CGPoint(x: 720, y: 450))
+    var mismatch = m; mismatch.build = build + "x"
+    injector.apply(mismatch); precondition(posted.count == 1 && gestureEvent(mismatch, hostBuild: build, rect: hostRect) == nil)
+    for (subtype, phase, scalar) in [(Int64(99), Int64(2), 0.25), (8, 0, 0.25), (8, 2, 4.5), (22, 1, 0)] {
+        let bad = Viewer.gestureMessage(NSEvent(cgEvent: gestureFixture(subtype, phase: phase, scalar: scalar))!, point: NSPoint(x: 110, y: 70), rect: viewRect)!
+        precondition(gestureEvent(bad, hostBuild: build, rect: hostRect) == nil)
+    }
+    var garbage = m; garbage.data = Data([1, 2, 3]); precondition(garbage.valid && gestureEvent(garbage, hostBuild: build, rect: hostRect) == nil)
+    var oversized = m; oversized.data = Data(count: InputMessage.gestureDataLimit + 1); precondition(!oversized.valid)
+    var noBuild = m; noBuild.build = nil; precondition(!noBuild.valid)
+    let plain = try JSONEncoder().encode(InputMessage(kind: .move))
+    precondition(!InputMessage(kind: .move, data: Data([1])).valid && plain.count < 2048)
+    print("PASS magnify CGEvent bytes survive wire roundtrip and are replayed at the mapped host point; wrong subtype/phase/scalar, garbage, oversize and build mismatch rejected (\(m.data!.count) event bytes, \(wire.count) wire bytes)")
+}
+func sessionTests(_ code: ConnectionCode) {
+    let t0 = Date(timeIntervalSince1970: 1000)
+    var s = ViewerSession(); s.start(code)
+    precondition(s.closed(failure: nil, now: t0) == .retry(attempt: 1) && s.closed(failure: .posix(.ETIMEDOUT), now: t0 + 2) == .retry(attempt: 2))
+    s.connected()
+    precondition(s.closed(failure: .tls(-9806), now: t0 + 10) == .retry(attempt: 1))
+    precondition(s.closed(failure: nil, now: t0 + 129) == .retry(attempt: 2) && s.closed(failure: nil, now: t0 + 130) == .giveUp && s.code == nil)
+    s.start(code); precondition(s.closed(failure: .tls(-9820)) == .wrongCode && s.code == nil)
+    s.start(code); let g = s.generation; s.stop(); precondition(s.generation != g && s.closed(failure: nil) == .idle)
+    print("PASS viewer session retries non-user closes every \(Int(ViewerSession.retryDelay))s for 2 minutes, stops on wrong code and user stop")
 }

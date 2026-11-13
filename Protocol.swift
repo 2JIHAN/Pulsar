@@ -4,6 +4,7 @@ import Security
 import Darwin
 import CoreGraphics
 import CoreMedia
+import AppKit
 
 enum WireError: Error { case invalid }
 struct ConnectionCode: Codable {
@@ -51,7 +52,7 @@ struct PacketParser {
     }
 }
 struct InputMessage: Codable {
-    enum Kind: String, Codable { case move, down, up, scroll, keyDown, keyUp, flags, release }
+    enum Kind: String, Codable { case move, down, up, scroll, keyDown, keyUp, flags, release, gesture }
     var kind: Kind
     var x: Double = 0
     var y: Double = 0
@@ -59,7 +60,75 @@ struct InputMessage: Codable {
     var flags: UInt64 = 0
     var dx: Double = 0
     var dy: Double = 0
-    var valid: Bool { x.isFinite && y.isFinite && (0...1).contains(x) && (0...1).contains(y) && dx.isFinite && dy.isFinite && abs(dx) <= 1000 && abs(dy) <= 1000 && code <= 255 }
+    // Gesture only: the viewer's serialized CGEvent and the OS build that produced it.
+    var data: Data? = nil
+    var build: String? = nil
+    static let gestureDataLimit = 64 * 1024
+    var valid: Bool {
+        guard x.isFinite && y.isFinite && (0...1).contains(x) && (0...1).contains(y) && dx.isFinite && dy.isFinite && abs(dx) <= 1000 && abs(dy) <= 1000 && code <= 255 else { return false }
+        guard kind == .gesture else { return data == nil && build == nil }
+        guard let data, let build else { return false }
+        return !data.isEmpty && data.count <= Self.gestureDataLimit && !build.isEmpty && build.count <= 32
+    }
+}
+let osBuild: String? = {
+    var size = 0
+    guard sysctlbyname("kern.osversion", nil, &size, nil, 0) == 0, size > 1 else { return nil }
+    var bytes = [CChar](repeating: 0, count: size)
+    guard sysctlbyname("kern.osversion", &bytes, &size, nil, 0) == 0 else { return nil }
+    return String(cString: bytes)
+}()
+// Ported from ThunderControl NativeGesture.swift. Classifies only; the original event bytes are replayed.
+struct NativeGestureDescriptor: Equatable {
+    enum Kind { case pinch, rotate, swipe, smartMagnify }
+    enum Phase { case none, mayBegin, began, changed, ended, cancelled }
+    let kind: Kind
+    let phase: Phase
+    var valid: Bool { kind == .smartMagnify ? phase == .none : (phase != .none || kind == .swipe) }
+    static func decode(_ event: CGEvent) -> NativeGestureDescriptor? {
+        guard event.type.rawValue == 29 || event.type.rawValue == 30, let native = NSEvent(cgEvent: event) else { return nil }
+        let kind: Kind
+        switch event.getIntegerValueField(CGEventField(rawValue: 110)!) {
+        case 8:
+            guard native.type == .magnify, native.magnification.isFinite, abs(native.magnification) <= 4 else { return nil }
+            kind = .pinch
+        case 5:
+            guard native.type == .rotate, native.rotation.isFinite, abs(native.rotation) <= 360 else { return nil }
+            kind = .rotate
+        case 16:
+            let direction = event.getIntegerValueField(CGEventField(rawValue: 115)!)
+            guard native.type == .swipe, [Int64(1), 2, 4, 8].contains(direction), native.deltaX.isFinite, native.deltaY.isFinite,
+                  abs(native.deltaX) <= 1, abs(native.deltaY) <= 1, native.deltaX != 0 || native.deltaY != 0 else { return nil }
+            kind = .swipe
+        case 22:
+            guard native.type == .smartMagnify else { return nil }
+            kind = .smartMagnify
+        default: return nil
+        }
+        // Public NSEvent phase semantics, not IOHID numeric phases.
+        let phase: Phase
+        switch native.phase {
+        case []: phase = .none
+        case .mayBegin: phase = .mayBegin
+        case .began: phase = .began
+        case .changed: phase = .changed
+        case .ended: phase = .ended
+        case .cancelled: phase = .cancelled
+        default: return nil
+        }
+        let result = Self(kind: kind, phase: phase)
+        return result.valid ? result : nil
+    }
+}
+// CGEvent's serialized layout is private and can change between OS builds, so the bytes are
+// only recreated when both Macs run the identical build.
+func gestureEvent(_ m: InputMessage, hostBuild: String?, rect: CGRect) -> CGEvent? {
+    guard m.kind == .gesture, m.valid, let data = m.data, m.build == hostBuild,
+          let point = normalizedPoint(x: m.x, y: m.y, rect: rect),
+          let event = CGEvent(withDataAllocator: nil, data: data as CFData),
+          NativeGestureDescriptor.decode(event) != nil else { return nil }
+    event.location = point
+    return event
 }
 func normalizedPoint(x: Double, y: Double, rect: CGRect) -> CGPoint? {
     guard x.isFinite, y.isFinite, (0...1).contains(x), (0...1).contains(y), rect.width > 0, rect.height > 0 else { return nil }
@@ -137,6 +206,56 @@ final class Peer {
     func close() {
         guard !closed else { return }; closed = true; ready = false
         connection.cancel(); onClose?(); onClose = nil
+    }
+}
+// Keeps one authenticated peer. A newly authenticated peer replaces the active one because a
+// viewer reconnecting after a network stall arrives before the host notices the old socket died.
+final class HostPeers {
+    private(set) var peers = [Peer]()
+    private(set) var active: Peer?
+    var onActive: ((Peer) -> Void)?
+    var onInactive: (() -> Void)?
+    var onPacket: ((Peer, Data) -> Void)?
+    func accept(_ c: NWConnection) {
+        guard peers.filter({ $0 !== active }).count < 3 else { c.cancel(); return }
+        let p = Peer(c); peers.append(p)
+        p.onReady = { [weak self, weak p] in
+            guard let self, let p else { return }
+            self.active?.close()
+            self.active = p
+            self.onActive?(p)
+        }
+        p.onPacket = { [weak self, weak p] data in guard let self, let p, self.active === p else { return }; self.onPacket?(p, data) }
+        p.onClose = { [weak self, weak p] in
+            guard let self, let p else { return }
+            self.peers.removeAll { $0 === p }
+            if self.active === p { self.active = nil; self.onInactive?() }
+        }
+        p.start()
+    }
+    func closeAll() { for p in peers { p.close() }; peers.removeAll(); active = nil }
+}
+// Holds the code while the user wants a connection, so any close the user did not ask for redials.
+struct ViewerSession {
+    enum Decision: Equatable { case idle, wrongCode, retry(attempt: Int), giveUp }
+    static let retryDelay: TimeInterval = 2, retryWindow: TimeInterval = 120, silenceLimit: TimeInterval = 6
+    private(set) var code: ConnectionCode?
+    private(set) var generation = 0
+    private(set) var attempts = 0
+    private var live = false
+    private var since: Date?
+    mutating func start(_ c: ConnectionCode) { stop(); code = c }
+    mutating func stop() { code = nil; generation += 1; attempts = 0; live = false; since = nil }
+    mutating func connected() { live = true; attempts = 0; since = nil }
+    mutating func closed(failure: NWError?, now: Date = Date()) -> Decision {
+        guard code != nil else { return .idle }
+        let wasLive = live; live = false
+        // Only an attempt that never finished the handshake can be a PSK mismatch.
+        if !wasLive, case .tls = failure { stop(); return .wrongCode }
+        let start = since ?? now; since = start
+        guard now.timeIntervalSince(start) < Self.retryWindow else { stop(); return .giveUp }
+        attempts += 1
+        return .retry(attempt: attempts)
     }
 }
 func localAddresses() -> [(String, String)] {
