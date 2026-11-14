@@ -175,6 +175,56 @@ func tailnetAllows(whois: Data?, selfLogin: String?) -> Bool {
     guard let whois, let selfLogin, !selfLogin.isEmpty, let login = whoisLogin(whois) else { return false }
     return login == selfLogin
 }
+enum PeerKind: Equatable { case owner, guest }
+
+func hostAllowsInput(peerKind: PeerKind, guestInputAllowed: Bool, accessibilityTrusted: Bool = true) -> Bool {
+    guard accessibilityTrusted else { return false }
+    switch peerKind {
+    case .owner: return true
+    case .guest: return guestInputAllowed
+    }
+}
+
+struct HostPreferences {
+    static let allowRemoteAccessKey = "allowRemoteAccess"
+    static let legacyAutoShareKey = "autoShare"
+    static let legacyAllowInputKey = "allowRemoteInput"
+    static let allowGuestInputKey = "allowGuestInput"
+    static let preventSleepKey = "preventSleep"
+
+    static func allowRemoteAccess(_ d: UserDefaults = .standard) -> Bool {
+        if d.object(forKey: allowRemoteAccessKey) != nil {
+            return d.bool(forKey: allowRemoteAccessKey)
+        }
+        if d.object(forKey: legacyAutoShareKey) != nil || d.object(forKey: legacyAllowInputKey) != nil {
+            let migrated = d.bool(forKey: legacyAutoShareKey) || d.bool(forKey: legacyAllowInputKey)
+            d.set(migrated, forKey: allowRemoteAccessKey)
+            return migrated
+        }
+        return true
+    }
+
+    static func setAllowRemoteAccess(_ enabled: Bool, _ d: UserDefaults = .standard) {
+        d.set(enabled, forKey: allowRemoteAccessKey)
+    }
+
+    static func allowGuestInput(_ d: UserDefaults = .standard) -> Bool {
+        d.object(forKey: allowGuestInputKey) as? Bool ?? false
+    }
+
+    static func setAllowGuestInput(_ enabled: Bool, _ d: UserDefaults = .standard) {
+        d.set(enabled, forKey: allowGuestInputKey)
+    }
+
+    static func preventSleep(_ d: UserDefaults = .standard) -> Bool {
+        d.object(forKey: preventSleepKey) as? Bool ?? true
+    }
+
+    static func setPreventSleep(_ enabled: Bool, _ d: UserDefaults = .standard) {
+        d.set(enabled, forKey: preventSleepKey)
+    }
+}
+
 final class Peer {
     let connection: NWConnection
     var onPacket: ((Data) -> Void)?
@@ -190,8 +240,13 @@ final class Peer {
     // ends exchange a hello first and only then count as ready.
     static let hello = Data("PULSAR1".utf8)
     let greet: Bool
+    let kind: PeerKind
     private(set) var connected = false
-    init(_ connection: NWConnection, greet: Bool = false) { self.connection = connection; self.greet = greet }
+    init(_ connection: NWConnection, greet: Bool = false, kind: PeerKind = .guest) {
+        self.connection = connection
+        self.greet = greet
+        self.kind = kind
+    }
     func start() {
         connection.stateUpdateHandler = { [weak self] state in
             guard let self = self, !self.closed else { return }
@@ -262,9 +317,9 @@ final class HostPeers {
     var onInactive: (() -> Void)?
     var onPacket: ((Peer, Data) -> Void)?
     private var authorizing = 0
-    func accept(_ c: NWConnection, greet: Bool = false) {
+    func accept(_ c: NWConnection, greet: Bool = false, kind: PeerKind = .guest) {
         guard peers.filter({ $0 !== active }).count < 3 else { c.cancel(); return }
-        let p = Peer(c, greet: greet); peers.append(p)
+        let p = Peer(c, greet: greet, kind: kind); peers.append(p)
         p.onReady = { [weak self, weak p] in
             guard let self, let p else { return }
             self.active?.close()
@@ -288,7 +343,7 @@ final class HostPeers {
         authorize(ip) { [weak self] ok in
             guard let self else { c.cancel(); return }
             self.authorizing -= 1
-            if ok { self.accept(c, greet: true) } else { c.cancel() }
+            if ok { self.accept(c, greet: true, kind: .owner) } else { c.cancel() }
         }
     }
     func closeAll() { for p in peers { p.close() }; peers.removeAll(); active = nil }
@@ -403,18 +458,42 @@ enum FPSOption: Int, Codable, CaseIterable {
     case fps60 = 60
 }
 
+struct VirtualDisplayRequest: Codable, Equatable {
+    var enabled: Bool
+    var width: Int
+    var height: Int
+    var scale: Int
+
+    var valid: Bool {
+        (640...6016).contains(width) && (480...3384).contains(height) && (scale == 1 || scale == 2)
+    }
+
+    static func forScreen(_ screen: NSScreen? = nil, enabled: Bool) -> VirtualDisplayRequest {
+        let s = screen ?? NSScreen.main ?? NSScreen.screens.first
+        let scale = (s?.backingScaleFactor ?? 2.0) >= 2.0 ? 2 : 1
+        let frame = s?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let rawW = Int((frame.width * CGFloat(scale)).rounded())
+        let rawH = Int((frame.height * CGFloat(scale)).rounded())
+        let w = min(6016, max(640, (rawW / 2) * 2))
+        let h = min(3384, max(480, (rawH / 2) * 2))
+        return VirtualDisplayRequest(enabled: enabled, width: w, height: h, scale: scale)
+    }
+}
+
 struct StreamQualityPreferences: Equatable {
     var codec: CodecPreference = .auto
     var chroma: ChromaOption = .yuv420
     var bitrate: BitrateOption = .auto
     var maxResolution: MaxResolutionOption = .p1080
     var fps: FPSOption = .fps30
+    var useVirtualDisplay: Bool = true
 
     private static let codecKey = "quality.codec"
     private static let chromaKey = "quality.chroma"
     private static let bitrateKey = "quality.bitrate"
     private static let resolutionKey = "quality.maxResolution"
     private static let fpsKey = "quality.fps"
+    private static let virtualDisplayKey = "quality.useVirtualDisplay"
 
     static func load(_ d: UserDefaults = .standard) -> StreamQualityPreferences {
         var p = StreamQualityPreferences()
@@ -423,6 +502,7 @@ struct StreamQualityPreferences: Equatable {
         if d.object(forKey: bitrateKey) != nil, let v = BitrateOption(rawValue: d.integer(forKey: bitrateKey)) { p.bitrate = v }
         if let raw = d.string(forKey: resolutionKey), let v = MaxResolutionOption(rawValue: raw) { p.maxResolution = v }
         if d.object(forKey: fpsKey) != nil, let v = FPSOption(rawValue: d.integer(forKey: fpsKey)) { p.fps = v }
+        if d.object(forKey: virtualDisplayKey) != nil { p.useVirtualDisplay = d.bool(forKey: virtualDisplayKey) }
         return p
     }
     func save(_ d: UserDefaults = .standard) {
@@ -431,9 +511,10 @@ struct StreamQualityPreferences: Equatable {
         d.set(bitrate.rawValue, forKey: Self.bitrateKey)
         d.set(maxResolution.rawValue, forKey: Self.resolutionKey)
         d.set(fps.rawValue, forKey: Self.fpsKey)
+        d.set(useVirtualDisplay, forKey: Self.virtualDisplayKey)
     }
-    func request(hevcDecode: Bool) -> QualityRequest {
-        QualityRequest(codec: codec, chroma: codec == .h264 ? .yuv420 : chroma, bitrate: bitrate, maxResolution: maxResolution, fps: fps, hevcDecode: hevcDecode)
+    func request(hevcDecode: Bool, virtualDisplay: VirtualDisplayRequest? = nil) -> QualityRequest {
+        QualityRequest(codec: codec, chroma: codec == .h264 ? .yuv420 : chroma, bitrate: bitrate, maxResolution: maxResolution, fps: fps, hevcDecode: hevcDecode, virtualDisplay: virtualDisplay)
     }
 }
 
@@ -446,14 +527,17 @@ struct QualityRequest: Codable, Equatable {
     var maxResolution: MaxResolutionOption
     var fps: FPSOption
     var hevcDecode: Bool
+    var virtualDisplay: VirtualDisplayRequest? = nil
 
     func wireMessage() -> Data {
         let json = (try? JSONEncoder().encode(self)) ?? Data()
         return Data([Self.messageType]) + json
     }
     static func decodeWire(_ data: Data) -> QualityRequest? {
-        guard data.first == messageType, data.count > 1, data.count <= maxWireBytes else { return nil }
-        return try? JSONDecoder().decode(QualityRequest.self, from: data.dropFirst())
+        guard data.first == messageType, data.count > 1, data.count <= maxWireBytes,
+              let req = try? JSONDecoder().decode(QualityRequest.self, from: data.dropFirst()) else { return nil }
+        if let vd = req.virtualDisplay, !vd.valid { return nil }
+        return req
     }
 }
 
@@ -465,20 +549,45 @@ struct EffectiveQuality: Codable, Equatable {
     var bitrateMbps: Int
     var maxResolution: MaxResolutionOption
     var fps: FPSOption
+    var virtualDisplay: Bool = false
+
+    enum CodingKeys: String, CodingKey {
+        case codec, chroma, bitrateMbps, maxResolution, fps, virtualDisplay
+    }
+
+    init(codec: ResolvedCodec, chroma: ChromaOption, bitrateMbps: Int, maxResolution: MaxResolutionOption, fps: FPSOption, virtualDisplay: Bool = false) {
+        self.codec = codec
+        self.chroma = chroma
+        self.bitrateMbps = bitrateMbps
+        self.maxResolution = maxResolution
+        self.fps = fps
+        self.virtualDisplay = virtualDisplay
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        codec = try c.decode(ResolvedCodec.self, forKey: .codec)
+        chroma = try c.decode(ChromaOption.self, forKey: .chroma)
+        bitrateMbps = try c.decode(Int.self, forKey: .bitrateMbps)
+        maxResolution = try c.decode(MaxResolutionOption.self, forKey: .maxResolution)
+        fps = try c.decode(FPSOption.self, forKey: .fps)
+        virtualDisplay = try c.decodeIfPresent(Bool.self, forKey: .virtualDisplay) ?? false
+    }
 
     static let legacyDefaults = EffectiveQuality(codec: .h264, chroma: .yuv420, bitrateMbps: 8, maxResolution: .p1080, fps: .fps30)
 
     var summary: String {
         let codecPart = chroma == .yuv444 ? "\(codec.label) 4:4:4" : codec.label
-        return "\(codecPart) · \(maxResolution.label) · \(fps.rawValue)fps · \(bitrateMbps)Mbps"
+        let vdPart = virtualDisplay ? " · 가상 화면" : ""
+        return "\(codecPart) · \(maxResolution.label) · \(fps.rawValue)fps · \(bitrateMbps)Mbps\(vdPart)"
     }
 
-    static func resolve(_ req: QualityRequest, hostHEVCEncode: Bool, hostHEVC444Encode: Bool = true) -> EffectiveQuality {
+    static func resolve(_ req: QualityRequest, hostHEVCEncode: Bool, hostHEVC444Encode: Bool = true, virtualDisplay: Bool = false) -> EffectiveQuality {
         let canHEVC = hostHEVCEncode && req.hevcDecode
         let resolvedCodec: ResolvedCodec = (req.codec != .h264 && canHEVC) ? .hevc : .h264
         let resolvedChroma: ChromaOption = (resolvedCodec == .hevc && req.chroma == .yuv444 && hostHEVC444Encode) ? .yuv444 : .yuv420
         let mbps = BitrateOption.allowedMbps.contains(req.bitrate.mbps) ? req.bitrate.mbps : 8
-        return EffectiveQuality(codec: resolvedCodec, chroma: resolvedChroma, bitrateMbps: mbps, maxResolution: req.maxResolution, fps: req.fps)
+        return EffectiveQuality(codec: resolvedCodec, chroma: resolvedChroma, bitrateMbps: mbps, maxResolution: req.maxResolution, fps: req.fps, virtualDisplay: virtualDisplay)
     }
 
     func wireMessage() -> Data {

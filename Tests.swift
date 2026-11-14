@@ -63,6 +63,8 @@ func runSelfTests() {
         hot.set(true); hot.set(false); precondition(pushes == 2 && pops.count == 2)
         print("PASS symbolic hot key mode push/pop balanced with the pushed token, no double pop")
         uiModelTests()
+        hostingTests()
+        virtualDisplayTests()
         let test = TLSTest(secret: decoded.secret); test.start(); dispatchMain()
     } catch { print("FAIL pure protocol tests"); exit(1) }
 }
@@ -259,13 +261,25 @@ func videoTests() throws {
     }
 }
 func qualityTests() {
-    let req = QualityRequest(codec: .auto, chroma: .yuv444, bitrate: .mbps20, maxResolution: .p1440, fps: .fps60, hevcDecode: true)
+    let req = QualityRequest(codec: .auto, chroma: .yuv444, bitrate: .mbps20, maxResolution: .p1440, fps: .fps60, hevcDecode: true,
+                               virtualDisplay: VirtualDisplayRequest(enabled: true, width: 3024, height: 1890, scale: 2))
     let wireReq = req.wireMessage()
     precondition(wireReq.count <= QualityRequest.maxWireBytes && QualityRequest.decodeWire(wireReq) == req)
+    let legacyReqWire = Data([5]) + Data(#"{"codec":"auto","chroma":"444","bitrate":20,"maxResolution":"1440p","fps":60,"hevcDecode":true}"#.utf8)
+    let decodedLegacyReq = QualityRequest.decodeWire(legacyReqWire)
+    precondition(decodedLegacyReq != nil && decodedLegacyReq?.virtualDisplay == nil)
+    let futureReqWire = Data([5]) + Data(#"{"codec":"auto","chroma":"420","bitrate":0,"maxResolution":"1080p","fps":30,"hevcDecode":true,"futureField":123}"#.utf8)
+    precondition(QualityRequest.decodeWire(futureReqWire) != nil)
+
     let eff = EffectiveQuality(codec: .hevc, chroma: .yuv444, bitrateMbps: 20, maxResolution: .p1440, fps: .fps60)
     let wireEff = eff.wireMessage()
     precondition(wireEff.count <= EffectiveQuality.maxWireBytes && EffectiveQuality.decodeWire(wireEff) == eff)
     precondition(eff.summary == "HEVC 4:4:4 · 1440p · 60fps · 20Mbps")
+    let effVD = EffectiveQuality(codec: .hevc, chroma: .yuv420, bitrateMbps: 20, maxResolution: .p1440, fps: .fps60, virtualDisplay: true)
+    precondition(EffectiveQuality.decodeWire(effVD.wireMessage()) == effVD)
+    precondition(effVD.summary == "HEVC · 1440p · 60fps · 20Mbps · 가상 화면")
+    let legacyEffWire = Data([6]) + Data(#"{"codec":"hevc","chroma":"420","bitrateMbps":20,"maxResolution":"1440p","fps":60}"#.utf8)
+    precondition(EffectiveQuality.decodeWire(legacyEffWire) == EffectiveQuality(codec: .hevc, chroma: .yuv420, bitrateMbps: 20, maxResolution: .p1440, fps: .fps60, virtualDisplay: false))
     precondition(EffectiveQuality(codec: .hevc, chroma: .yuv420, bitrateMbps: 20, maxResolution: .p1440, fps: .fps60).summary == "HEVC · 1440p · 60fps · 20Mbps")
 
     let pad = String(repeating: " ", count: 520)
@@ -277,8 +291,15 @@ func qualityTests() {
         Data([5]) + Data(#"{"codec":"auto","chroma":"420","bitrate":0,"maxResolution":"8k","fps":30,"hevcDecode":true}"#.utf8),
         Data([5]) + Data(#"{"codec":"auto","chroma":"420","bitrate":0,"maxResolution":"1080p","fps":120,"hevcDecode":true}"#.utf8),
         Data([5]) + Data((pad + #"{"codec":"auto","chroma":"420","bitrate":0,"maxResolution":"1080p","fps":30,"hevcDecode":true}"#).utf8),
+        Data([5]) + Data(#"{"codec":"auto","chroma":"420","bitrate":0,"maxResolution":"1080p","fps":30,"hevcDecode":true,"virtualDisplay":{"enabled":true,"width":639,"height":480,"scale":1}}"#.utf8),
+        Data([5]) + Data(#"{"codec":"auto","chroma":"420","bitrate":0,"maxResolution":"1080p","fps":30,"hevcDecode":true,"virtualDisplay":{"enabled":true,"width":6017,"height":3384,"scale":2}}"#.utf8),
+        Data([5]) + Data(#"{"codec":"auto","chroma":"420","bitrate":0,"maxResolution":"1080p","fps":30,"hevcDecode":true,"virtualDisplay":{"enabled":true,"width":1920,"height":479,"scale":1}}"#.utf8),
+        Data([5]) + Data(#"{"codec":"auto","chroma":"420","bitrate":0,"maxResolution":"1080p","fps":30,"hevcDecode":true,"virtualDisplay":{"enabled":true,"width":1920,"height":3385,"scale":2}}"#.utf8),
+        Data([5]) + Data(#"{"codec":"auto","chroma":"420","bitrate":0,"maxResolution":"1080p","fps":30,"hevcDecode":true,"virtualDisplay":{"enabled":true,"width":1920,"height":1080,"scale":3}}"#.utf8),
     ]
     for (i, d) in badReqs.enumerated() { precondition(QualityRequest.decodeWire(d) == nil, "bad req \(i)") }
+    precondition(QualityRequest.decodeWire(Data([5]) + Data(#"{"codec":"auto","chroma":"420","bitrate":0,"maxResolution":"1080p","fps":30,"hevcDecode":true,"virtualDisplay":{"enabled":true,"width":640,"height":480,"scale":1}}"#.utf8)) != nil)
+    precondition(QualityRequest.decodeWire(Data([5]) + Data(#"{"codec":"auto","chroma":"420","bitrate":0,"maxResolution":"1080p","fps":30,"hevcDecode":true,"virtualDisplay":{"enabled":true,"width":6016,"height":3384,"scale":2}}"#.utf8)) != nil)
     let badEffs: [Data] = [
         Data([5]) + wireEff.dropFirst(),
         Data([6]) + Data(#"{"codec":"h264","chroma":"444","bitrateMbps":20,"maxResolution":"1440p","fps":60}"#.utf8),
@@ -302,11 +323,11 @@ func qualityTests() {
     let suite = "com.tamcut.Pulsar.qualitytest.\(UUID().uuidString)", defaults = UserDefaults(suiteName: suite)!
     defer { defaults.removePersistentDomain(forName: suite) }
     precondition(StreamQualityPreferences.load(defaults) == StreamQualityPreferences())
-    let saved = StreamQualityPreferences(codec: .hevc, chroma: .yuv444, bitrate: .mbps35, maxResolution: .native, fps: .fps60)
+    let saved = StreamQualityPreferences(codec: .hevc, chroma: .yuv444, bitrate: .mbps35, maxResolution: .native, fps: .fps60, useVirtualDisplay: false)
     saved.save(defaults)
     precondition(StreamQualityPreferences.load(defaults) == saved)
     precondition(StreamQualityPreferences(codec: .h264, chroma: .yuv444, bitrate: .auto, maxResolution: .p1080, fps: .fps30).request(hevcDecode: true).chroma == .yuv420)
-    print("PASS quality request/effective JSON roundtrip, unknown/oversize rejection, host resolution, scaling and UserDefaults persistence")
+    print("PASS quality request/effective JSON roundtrip (with/without virtualDisplay), bounds rejection, host resolution, scaling and UserDefaults persistence")
 }
 var tailnet: TailnetHostTest?
 // Plain TCP host path with an injected authorizer standing in for `tailscale whois`.
@@ -517,4 +538,118 @@ func uiModelTests() {
     print("PASS saved session shortcuts consumed locally (⌃⌥⇧Q, ⌃⌥⌘F, custom ⇧⌘E), other combos and keyUp forwarded; recorder rejects a combo used by another action")
     precondition(Permission.all.map(\.verifiable) == [true, true, true])
     print("PASS all three permissions report usable/not usable and count toward the missing-permission line")
+}
+
+func hostingTests() {
+    func freshDefaults() -> (String, UserDefaults) {
+        let suite = "com.tamcut.Pulsar.hostingtest.\(UUID().uuidString)"
+        return (suite, UserDefaults(suiteName: suite)!)
+    }
+
+    let (s0, d0) = freshDefaults(); defer { d0.removePersistentDomain(forName: s0) }
+    precondition(HostPreferences.allowRemoteAccess(d0) == true)
+    precondition(HostPreferences.allowGuestInput(d0) == false)
+    precondition(HostPreferences.preventSleep(d0) == true)
+
+    let (s1, d1) = freshDefaults(); defer { d1.removePersistentDomain(forName: s1) }
+    d1.set(false, forKey: HostPreferences.legacyAutoShareKey)
+    d1.set(false, forKey: HostPreferences.legacyAllowInputKey)
+    precondition(HostPreferences.allowRemoteAccess(d1) == false)
+
+    let (s2, d2) = freshDefaults(); defer { d2.removePersistentDomain(forName: s2) }
+    d2.set(false, forKey: HostPreferences.legacyAutoShareKey)
+    d2.set(true, forKey: HostPreferences.legacyAllowInputKey)
+    precondition(HostPreferences.allowRemoteAccess(d2) == true)
+
+    let (s3, d3) = freshDefaults(); defer { d3.removePersistentDomain(forName: s3) }
+    d3.set(true, forKey: HostPreferences.legacyAutoShareKey)
+    d3.set(false, forKey: HostPreferences.legacyAllowInputKey)
+    precondition(HostPreferences.allowRemoteAccess(d3) == true)
+    HostPreferences.setAllowRemoteAccess(false, d3)
+    precondition(HostPreferences.allowRemoteAccess(d3) == false)
+
+    HostPreferences.setAllowGuestInput(true, d0)
+    HostPreferences.setPreventSleep(false, d0)
+    precondition(HostPreferences.allowGuestInput(d0) == true && HostPreferences.preventSleep(d0) == false)
+    print("PASS hosting preferences migration (default on, either legacy key on -> on, both off -> off) and guest/sleep persistence")
+
+    precondition(hostAllowsInput(peerKind: .owner, guestInputAllowed: false, accessibilityTrusted: true))
+    precondition(hostAllowsInput(peerKind: .owner, guestInputAllowed: true, accessibilityTrusted: true))
+    precondition(!hostAllowsInput(peerKind: .owner, guestInputAllowed: true, accessibilityTrusted: false))
+    precondition(!hostAllowsInput(peerKind: .guest, guestInputAllowed: false, accessibilityTrusted: true))
+    precondition(hostAllowsInput(peerKind: .guest, guestInputAllowed: true, accessibilityTrusted: true))
+    precondition(!hostAllowsInput(peerKind: .guest, guestInputAllowed: true, accessibilityTrusted: false))
+    print("PASS owner vs guest input gating (owner always allowed when trusted, guest requires toggle)")
+
+    var acquired = 0, released = [UInt32]()
+    let sleep = SleepAssertion()
+    sleep.acquire = { acquired += 1; return UInt32(100 + acquired) }
+    sleep.release = { released.append($0) }
+    sleep.set(false); precondition(acquired == 0 && released.isEmpty && !sleep.isHeld)
+    sleep.set(true); sleep.set(true); precondition(acquired == 1 && released.isEmpty && sleep.isHeld)
+    sleep.set(false); sleep.set(false); precondition(acquired == 1 && released == [101] && !sleep.isHeld)
+    sleep.set(true); sleep.set(false); precondition(acquired == 2 && released == [101, 102] && !sleep.isHeld)
+    print("PASS IOPMAssertion acquire/release balanced with injected callbacks, no double acquire or release")
+}
+
+func virtualDisplayTests() {
+    guard VirtualDisplay.isAvailable else {
+        print("SKIP (virtual display API unavailable)")
+        return
+    }
+    let app = NSApplication.shared
+    app.setActivationPolicy(.prohibited)
+
+    func pump(_ seconds: TimeInterval) {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            autoreleasepool {
+                if let event = app.nextEvent(matching: .any, until: Date().addingTimeInterval(0.05), inMode: .default, dequeue: true) {
+                    app.sendEvent(event)
+                }
+            }
+        }
+    }
+    func onlineIDs() -> [CGDirectDisplayID] {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 32)
+        var count: UInt32 = 0
+        precondition(CGGetOnlineDisplayList(32, &ids, &count) == .success)
+        return Array(ids.prefix(Int(count)))
+    }
+
+    let before = onlineIDs()
+    var vd: VirtualDisplay?
+    autoreleasepool {
+        vd = VirtualDisplay(width: 2880, height: 1800, scale: 2)
+    }
+    precondition(vd != nil, "VirtualDisplay creation failed")
+    let vid = vd!.displayID
+    precondition(!before.contains(vid))
+
+    var appeared = false
+    for _ in 0..<30 {
+        pump(0.1)
+        let current = onlineIDs()
+        if current.contains(vid), let mode = CGDisplayCopyDisplayMode(vid), mode.pixelWidth == 2880, mode.pixelHeight == 1800 {
+            appeared = true
+            break
+        }
+    }
+    precondition(appeared, "VirtualDisplay \(vid) did not appear with 2880x1800 pixel mode within 3s")
+
+    autoreleasepool {
+        vd?.destroy()
+        vd = nil
+    }
+    var disappeared = false
+    for _ in 0..<30 {
+        pump(0.1)
+        if !onlineIDs().contains(vid) {
+            disappeared = true
+            break
+        }
+    }
+    precondition(disappeared, "VirtualDisplay \(vid) did not disappear within 3s after release")
+    precondition(onlineIDs() == before)
+    print("PASS virtual display created id=\(vid) at 2880x1800 and disappeared within 3s on release")
 }

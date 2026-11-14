@@ -549,7 +549,8 @@ final class SettingsPage: NSObject {
     let permLabels = Permission.all.map { _ in label("", 12, .regular, Palette.secondary) }
     let recorders = ShortcutAction.allCases.map(ShortcutRecorder.init)
     let system = NSSwitch()
-    let autoShare = NSSwitch()
+    let allowAccess: NSSwitch
+    let preventSleep: NSSwitch
     let loginItem = NSSwitch()
     let loginNote = label("", 11, .regular, Palette.secondary)
     let keyNote = label("", 11, .regular, Palette.secondary)
@@ -558,23 +559,22 @@ final class SettingsPage: NSObject {
     let bitratePopup = NSPopUpButton()
     let resolutionPopup = NSPopUpButton()
     let fpsControl = NSSegmentedControl(labels: ["30 fps", "60 fps"], trackingMode: .selectOne, target: nil, action: nil)
+    let virtualDisplaySwitch = NSSwitch()
     let qualityNote = label("최근 연결: 없음", 11, .regular, Palette.secondary)
     private var lastEffective: String?
     private var isConnected = false
     private var changedWhileConnected = false
     var onSystemChanged: (() -> Void)?
-    static let autoShareKey = "autoShare"
-    static func autoShares(_ d: UserDefaults = .standard) -> Bool { d.object(forKey: autoShareKey) as? Bool ?? true }
-    init(allow: NSSwitch) {
+    init(allowAccess: NSSwitch, preventSleep: NSSwitch) {
+        self.allowAccess = allowAccess
+        self.preventSleep = preventSleep
         super.init()
-        autoShare.state = Self.autoShares() ? .on : .off
-        autoShare.target = self; autoShare.action = #selector(autoShareChanged)
         loginItem.target = self; loginItem.action = #selector(loginItemChanged)
         showLoginItem()
         let general = [
-            settingRow("Pulsar 실행 시 자동으로 공유 시작", "같은 Tailscale 계정의 Mac이 목록에서 바로 연결할 수 있습니다.", [autoShare]),
+            settingRow("이 Mac 원격 접속 허용", "켜 두면 Pulsar가 실행 중일 때 항상 접속을 기다립니다. 같은 Tailscale 계정의 Mac은 화면과 마우스·키보드를 모두 쓸 수 있습니다.", [allowAccess]),
+            settingRow("잠자기 방지", "원격 접속을 기다리는 동안 Mac이 잠들지 않도록 유지합니다.", [preventSleep]),
             settingRow("로그인 시 Pulsar 실행", nil, [loginNote, loginItem]),
-            settingRow("다른 Mac이 이 Mac을 조작하도록 허용", "끄면 화면만 보여 주고 마우스와 키보드 입력은 받지 않습니다.", [allow]),
         ]
         var permRows = [NSView]()
         for (i, p) in Permission.all.enumerated() {
@@ -599,7 +599,7 @@ final class SettingsPage: NSObject {
         codecPopup.addItems(withTitles: ["자동", "H.264", "HEVC (H.265)"])
         bitratePopup.addItems(withTitles: ["자동 (8 Mbps)", "5 Mbps", "10 Mbps", "20 Mbps", "35 Mbps", "50 Mbps"])
         resolutionPopup.addItems(withTitles: ["1080p (1920×1080)", "1440p (2560×1440)", "원본 (최대 3840×2400)"])
-        for c in [codecPopup, bitratePopup, resolutionPopup] as [NSControl] { c.target = self; c.action = #selector(qualityChanged) }
+        for c in [codecPopup, bitratePopup, resolutionPopup, virtualDisplaySwitch] as [NSControl] { c.target = self; c.action = #selector(qualityChanged) }
         for c in [chromaControl, fpsControl] as [NSSegmentedControl] { c.target = self; c.action = #selector(qualityChanged) }
         syncQualityControls()
         qualityNote.lineBreakMode = .byWordWrapping; qualityNote.maximumNumberOfLines = 0
@@ -609,6 +609,7 @@ final class SettingsPage: NSObject {
             settingRow("비트레이트", "최대 대역폭은 평균의 1.5배로 제한합니다.", [bitratePopup]),
             settingRow("최대 해상도", "호스트 기본 해상도를 짝수 크기와 비율을 유지해 축소합니다.", [resolutionPopup]),
             settingRow("프레임", "60 fps는 화면이 부드럽지만 더 많은 대역폭을 사용합니다.", [fpsControl]),
+            settingRow("접속 시 가상 디스플레이 사용", "상대 Mac에 이 Mac 크기의 가상 화면을 만들어 그 화면을 보여 줍니다. 원래 화면은 그대로 둡니다.", [virtualDisplaySwitch]),
         ]
         let info = Bundle.main.infoDictionary
         let version = label("Pulsar \(info?["CFBundleShortVersionString"] as? String ?? "") (\(info?["CFBundleVersion"] as? String ?? ""))", 11, .regular, Palette.secondary)
@@ -640,6 +641,7 @@ final class SettingsPage: NSObject {
         bitratePopup.selectItem(at: BitrateOption.allCases.firstIndex(of: prefs.bitrate) ?? 0)
         resolutionPopup.selectItem(at: MaxResolutionOption.allCases.firstIndex(of: prefs.maxResolution) ?? 0)
         fpsControl.selectedSegment = FPSOption.allCases.firstIndex(of: prefs.fps) ?? 0
+        virtualDisplaySwitch.state = prefs.useVirtualDisplay ? .on : .off
         updateChromaState(savedChroma: prefs.chroma)
     }
     private func updateChromaState(savedChroma: ChromaOption) {
@@ -654,6 +656,7 @@ final class SettingsPage: NSObject {
         prefs.bitrate = BitrateOption.allCases[max(0, bitratePopup.indexOfSelectedItem)]
         prefs.maxResolution = MaxResolutionOption.allCases[max(0, resolutionPopup.indexOfSelectedItem)]
         prefs.fps = FPSOption.allCases[max(0, fpsControl.selectedSegment)]
+        prefs.useVirtualDisplay = virtualDisplaySwitch.state == .on
         if sender === chromaControl {
             prefs.chroma = chromaControl.selectedSegment == 1 ? .yuv444 : .yuv420
         }
@@ -663,7 +666,6 @@ final class SettingsPage: NSObject {
     }
     @objc func open(_ sender: NSButton) { Permission.all[sender.tag].openSettings() }
     @objc func systemChanged() { UserDefaults.standard.set(system.state == .on, forKey: ShortcutAction.systemKey); onSystemChanged?() }
-    @objc func autoShareChanged() { UserDefaults.standard.set(autoShare.state == .on, forKey: Self.autoShareKey) }
     @objc func loginItemChanged() {
         do {
             if loginItem.state == .on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }

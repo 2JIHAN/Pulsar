@@ -69,6 +69,48 @@ final class VideoEncoder {
         } == noErr
     }
 }
+final class VirtualDisplay {
+    static var isAvailable: Bool { PulsarVirtualDisplayAPIAvailable() }
+    private var handle: NSObject?
+    let displayID: CGDirectDisplayID
+    let pixelWidth: Int
+    let pixelHeight: Int
+    let scale: Int
+
+    init?(width: Int, height: Int, scale: Int) {
+        guard Self.isAvailable,
+              (640...6016).contains(width), (480...3384).contains(height),
+              scale == 1 || scale == 2 else { return nil }
+        let pointW = scale == 2 ? width / 2 : width
+        let pointH = scale == 2 ? height / 2 : height
+        let pixelW = pointW * scale
+        let pixelH = pointH * scale
+
+        var preIDs = [CGDirectDisplayID](repeating: 0, count: 32)
+        var preCount: UInt32 = 0
+        CGGetOnlineDisplayList(32, &preIDs, &preCount)
+        let preList = preIDs.prefix(Int(preCount))
+
+        var createdID: CGDirectDisplayID = 0
+        guard let disp = PulsarCreateVirtualDisplay(UInt32(pixelW), UInt32(pixelH), UInt32(scale), &createdID),
+              createdID != 0,
+              !preList.contains(createdID) else { return nil }
+
+        self.handle = disp
+        self.displayID = createdID
+        self.pixelWidth = pixelW
+        self.pixelHeight = pixelH
+        self.scale = scale
+
+        // Do not touch the display configuration here. Measured on macOS 27: any CGBeginDisplayConfiguration
+        // that names this display pins it until the process exits, so releasing it would leave a stale
+        // screen after every session. macOS already adds it as an extended display right of the others.
+    }
+
+    func destroy() { handle = nil }
+    deinit { handle = nil }
+}
+
 final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     var stream: SCStream?
     // The completion must be called once the frame has been handed to the network.
@@ -83,15 +125,38 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     // because dropping an encoded frame would break the decoder's reference chain.
     private var inFlight = 0
     private var needsKeyframe = true
-    @MainActor func start(request: QualityRequest? = nil) async throws -> EffectiveQuality {
+    @MainActor func start(request: QualityRequest? = nil, targetDisplayID: CGDirectDisplayID? = nil, fallbackPixelSize: (Int, Int)? = nil) async throws -> EffectiveQuality {
         guard !stopped else { throw WireError.invalid }
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        let display: SCDisplay
+        if let targetDisplayID {
+            var matched: SCDisplay?
+            for attempt in 0..<10 {
+                guard !stopped else { throw WireError.invalid }
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                if let found = content.displays.first(where: { $0.displayID == targetDisplayID }) {
+                    let mode = CGDisplayCopyDisplayMode(targetDisplayID)
+                    if (mode?.pixelWidth ?? 0) > 0 || attempt == 9 {
+                        matched = found
+                        break
+                    }
+                }
+                if attempt < 9 { try await Task.sleep(nanoseconds: 200_000_000) }
+            }
+            guard let matched else { throw WireError.invalid }
+            display = matched
+        } else {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            guard !stopped else { throw WireError.invalid }
+            guard let found = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first else { throw WireError.invalid }
+            display = found
+        }
         guard !stopped else { throw WireError.invalid }
-        guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first else { throw WireError.invalid }
         rect = CGDisplayBounds(display.displayID)
         let mode = CGDisplayCopyDisplayMode(display.displayID)
-        let width = Double(mode?.pixelWidth ?? display.width), height = Double(mode?.pixelHeight ?? display.height)
-        let targetQuality = request.map { EffectiveQuality.resolve($0, hostHEVCEncode: VideoEncoder.supportsHardwareHEVC) } ?? .legacyDefaults
+        let modeW = mode?.pixelWidth ?? 0, modeH = mode?.pixelHeight ?? 0
+        let width = Double(modeW > 0 ? modeW : (fallbackPixelSize?.0 ?? display.width))
+        let height = Double(modeH > 0 ? modeH : (fallbackPixelSize?.1 ?? display.height))
+        let targetQuality = request.map { EffectiveQuality.resolve($0, hostHEVCEncode: VideoEncoder.supportsHardwareHEVC, virtualDisplay: targetDisplayID != nil) } ?? .legacyDefaults
         let bounds = request == nil ? (1920.0, 1200.0) : targetQuality.maxResolution.maxBounds
         let scaled = MaxResolutionOption.scaledSize(displayWidth: width, displayHeight: height, bounds: bounds)
 

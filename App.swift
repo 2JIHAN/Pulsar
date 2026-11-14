@@ -4,6 +4,7 @@ import ApplicationServices
 import AVFoundation
 import Carbon
 import VideoToolbox
+import IOKit.pwr_mgt
 
 @_silgen_name("CGSMainConnectionID") private func CGSMainConnectionID() -> Int32
 @_silgen_name("CGSSetGlobalHotKeyOperatingMode") private func CGSSetGlobalHotKeyOperatingMode(_ cid: Int32, _ mode: Int32) -> Int32
@@ -26,6 +27,27 @@ final class HotKeyMode {
         if on, token == nil { token = push() }
         else if !on, let t = token { token = nil; pop(t) }
     }
+}
+
+final class SleepAssertion {
+    var acquire: () -> IOPMAssertionID? = {
+        var id: IOPMAssertionID = 0
+        let ok = IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            "Pulsar hosting" as CFString,
+            &id
+        )
+        return ok == kIOReturnSuccess ? id : nil
+    }
+    var release: (IOPMAssertionID) -> Void = { IOPMAssertionRelease($0) }
+    private var id: IOPMAssertionID?
+    var isHeld: Bool { id != nil }
+    func set(_ on: Bool) {
+        if on, id == nil { id = acquire() }
+        else if !on, let current = id { id = nil; release(current) }
+    }
+    deinit { set(false) }
 }
 
 final class Viewer: NSView {
@@ -135,7 +157,11 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var returnPage = 1
     let addresses = NSPopUpButton()
     let code = NSSecureTextField()
-    let allow = NSSwitch()
+    let allowAccess = NSSwitch()
+    let preventSleep = NSSwitch()
+    let guestInput = NSSwitch()
+    let sleepAssertion = SleepAssertion()
+    var virtualDisplay: VirtualDisplay?
     let viewer = Viewer()
     let hostButton = NSButton(title: "공유 시작", target: nil, action: nil)
     var listener: NWListener?
@@ -209,7 +235,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         host.onInactive = { [weak self] in
             guard let self else { return }
             self.qualityWait?.cancel(); self.qualityWait = nil; self.awaitedPeer = nil
-            self.capture?.stop(); self.capture = nil; self.injector.release(); self.statusText = "연결 해제됨. 공유는 대기 중입니다."
+            self.capture?.stop(); self.capture = nil; self.virtualDisplay = nil; self.injector.release(); self.statusText = "연결 해제됨. 공유는 대기 중입니다."
         }
         host.onPacket = { [weak self] p, data in self?.hostPacket(p, data) }
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
@@ -226,10 +252,13 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         refreshDevices()
         settings.onSystemChanged = { [weak self] in self?.updateHotKeys() }
         if let listen = Permission.all.first(where: { $0.pane == "Privacy_ListenEvent" }), !listen.granted() { listen.request() }
-        if UserDefaults.standard.bool(forKey: allowKey) && AXIsProcessTrusted() { allow.state = .on }
-        if SettingsPage.autoShares() {
+        preventSleep.state = HostPreferences.preventSleep() ? .on : .off
+        guestInput.state = (HostPreferences.allowGuestInput() && AXIsProcessTrusted()) ? .on : .off
+        if HostPreferences.allowRemoteAccess() {
             if CGPreflightScreenCaptureAccess() { startHost() }
-            else { statusText = "자동 공유를 시작하지 못했습니다. 화면 기록 권한이 필요합니다." }
+            else { allowAccess.state = .off; statusText = "원격 접속을 시작하지 못했습니다. 화면 기록 권한이 필요합니다." }
+        } else {
+            allowAccess.state = .off
         }
         // Launch argument `-PulsarStartPage 0|1|2` opens a page directly (used for screenshots).
         select(min(2, max(0, UserDefaults.standard.integer(forKey: "PulsarStartPage"))))
@@ -241,7 +270,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.delegate = self; window.minSize = NSSize(width: 960, height: 600)
         let found = localAddresses().sorted { rank($0) < rank($1) }; ips = found.map { $0.1 }; addresses.addItems(withTitles: found.map { $0.0 }); if ips.isEmpty { ips = ["127.0.0.1"]; addresses.addItem(withTitle: "로컬 테스트 127.0.0.1") }
         hostButton.target = self; hostButton.action = #selector(toggleHost)
-        allow.target = self; allow.action = #selector(permission)
+        allowAccess.target = self; allowAccess.action = #selector(allowAccessChanged)
+        preventSleep.target = self; preventSleep.action = #selector(preventSleepChanged)
+        guestInput.target = self; guestInput.action = #selector(guestInputChanged)
 
         sidebar = SidebarController()
         sidebar.onSelect = { [weak self] page in self?.show(page) }
@@ -253,7 +284,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.disconnectViewer(); self.returnPage = 0
             self.session.start(DialTarget(tailnet: ip)); self.statusText = "\(d.name)에 연결하는 중…"; self.dial()
         }
-        settings = SettingsPage(allow: allow)
+        settings = SettingsPage(allowAccess: allowAccess, preventSleep: preventSleep)
         sessionView = SessionView(viewer: viewer)
         sessionView.fullScreen.target = self; sessionView.fullScreen.action = #selector(toggleFullScreen)
         sessionView.leave.target = self; sessionView.leave.action = #selector(disconnectViewer)
@@ -281,7 +312,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let connect = navyButton("접속", self, #selector(connectViewer))
         let disconnect = NSButton(title: "연결 해제", target: self, action: #selector(disconnectViewer))
         let codeRow = hstack([code, connect, disconnect], 8); codeRow.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
-        let note = label("다른 네트워크에서는 두 Mac 모두 같은 Tailscale 네트워크에 있어야 합니다. 화면은 기본 디스플레이 한 개입니다.", 11, .regular, Palette.secondary)
+        let note = label("다른 네트워크에서는 두 Mac 모두 같은 Tailscale 네트워크에 있어야 합니다.", 11, .regular, Palette.secondary)
         return scrollPage([
             heading("연결코드"), status, gap(16),
             sectionTitle("이 Mac 공유"),
@@ -290,6 +321,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 settingRow("Tailscale 바로 연결", "같은 Tailscale 계정의 Mac은 컴퓨터 목록에서 코드 없이 연결합니다.", [tailnetState]),
                 settingRow("주소", "연결코드에 넣을 주소입니다. 다른 네트워크에서는 Tailscale 주소를 고르세요.", [addresses]),
                 settingRow("연결코드", "주소, 포트, 비밀키가 들어 있습니다. 믿을 수 있는 경로로만 전달하세요.", [copy]),
+                settingRow("연결코드 접속자에게 마우스·키보드 허용", "끄면 연결코드로 접속한 상대는 화면만 볼 수 있습니다.", [guestInput]),
                 settingRow("긴급 중지", "공유와 접속을 모두 끊습니다. 원격 화면에서는 ⌘⌥⎋", [stop]),
             ]), gap(20),
             sectionTitle("다른 Mac에 접속"),
@@ -312,7 +344,12 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func refreshHostState() {
         hostButton.title = hosting ? "공유 중지" : "공유 시작"
+        allowAccess.state = hosting ? .on : .off
         computers.hosting = hosting
+        updateSleepAssertion()
+    }
+    func updateSleepAssertion() {
+        sleepAssertion.set(hosting && preventSleep.state == .on)
     }
     func refreshDevices() {
         guard !fetching else { return }
@@ -364,17 +401,38 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         split.splitViewItems[0].isCollapsed = false
         select(returnPage)
     }
-    @objc func permission() {
-        if allow.state == .on && !AXIsProcessTrusted() {
+    @objc func allowAccessChanged() {
+        if allowAccess.state == .on {
+            guard CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() else {
+                allowAccess.state = .off
+                HostPreferences.setAllowRemoteAccess(false)
+                statusText = "화면 기록 권한이 필요합니다. 설정(Command+,)에서 허용한 뒤 다시 켜세요."
+                return
+            }
+            HostPreferences.setAllowRemoteAccess(true)
+            if !hosting { startHost() }
+        } else {
+            HostPreferences.setAllowRemoteAccess(false)
+            if hosting { stopHost() }
+        }
+    }
+    @objc func preventSleepChanged() {
+        HostPreferences.setPreventSleep(preventSleep.state == .on)
+        updateSleepAssertion()
+    }
+    @objc func guestInputChanged() {
+        if guestInput.state == .on && !AXIsProcessTrusted() {
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
             _ = AXIsProcessTrustedWithOptions(options)
-            allow.state = .off; statusText = "기기 제어 및 데이터 접근 권한이 필요합니다. 설정에서 허용한 뒤 원격 입력 허용을 다시 켜세요."
+            guestInput.state = .off
+            HostPreferences.setAllowGuestInput(false)
+            statusText = "기기 제어 및 데이터 접근 권한이 필요합니다. 설정에서 허용한 뒤 다시 켜세요."
             select(2)
+            return
         }
-        UserDefaults.standard.set(allow.state == .on, forKey: allowKey)
-        if allow.state == .off { injector.release() }
+        HostPreferences.setAllowGuestInput(guestInput.state == .on)
+        if guestInput.state == .off && host.active?.kind == .guest { injector.release() }
     }
-    let allowKey = "allowRemoteInput"
     @objc func toggleHost() {
         if hosting { stopHost(); return }
         guard CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() else { statusText = "화면 기록 권한이 필요합니다. 설정(Command+,)에서 허용한 뒤 앱을 다시 여세요."; return }
@@ -444,21 +502,51 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func startCapture(for p: Peer, request: QualityRequest?) {
         gestureNoted = false
+        virtualDisplay = nil
         let sendEffective = request != nil
         let prefix = p.greet ? "Tailscale로 연결됨." : "암호화 연결됨."
-        statusText = prefix + " 화면 전송 중. 원격 입력은 설정 > 일반에서 제어합니다."
+        let inputNote = p.kind == .owner ? "같은 계정: 마우스·키보드 허용" : (guestInput.state == .on ? "연결코드: 마우스·키보드 허용" : "연결코드: 보기 전용")
+        statusText = prefix + " 화면 전송 준비 중…"
         let capture = Capture(); self.capture = capture
         capture.onFrame = { [weak self, weak p, weak capture] data, sent in guard let self = self, let capture = capture, self.host.active === p, self.capture === capture else { return }; p?.frame(data, sent: sent) }
         capture.onError = { [weak self, weak p] message in guard let self = self, self.host.active === p else { return }; p?.close(); self.statusText = message }
+
+        var createdVD: VirtualDisplay?
+        var vdFallback = false
+        if let vdReq = request?.virtualDisplay, vdReq.enabled {
+            if let vd = VirtualDisplay(width: vdReq.width, height: vdReq.height, scale: vdReq.scale) {
+                createdVD = vd
+                self.virtualDisplay = vd
+            } else {
+                vdFallback = true
+            }
+        }
+
         Task { @MainActor in
             do {
-                let actual = try await capture.start(request: request)
+                let actual: EffectiveQuality
+                if let vd = createdVD {
+                    do {
+                        actual = try await capture.start(request: request, targetDisplayID: vd.displayID, fallbackPixelSize: (vd.pixelWidth, vd.pixelHeight))
+                    } catch where self.host.active === p && self.capture === capture {
+                        if self.virtualDisplay === vd { self.virtualDisplay = nil }
+                        vdFallback = true
+                        actual = try await capture.start(request: request, targetDisplayID: nil)
+                    }
+                } else {
+                    actual = try await capture.start(request: request, targetDisplayID: nil)
+                }
                 if self.host.active === p, self.capture === capture {
                     self.injector.rect = capture.rect
                     if sendEffective { p.send(actual.wireMessage()) }
-                    self.statusText = prefix + " 화면 전송 중 (\(actual.summary)). 원격 입력은 설정 > 일반에서 제어합니다."
-                } else { capture.stop() }
+                    let fallbackNote = vdFallback ? " 가상 화면을 만들지 못해 기본 화면을 전송합니다." : ""
+                    self.statusText = prefix + " 화면 전송 중 (\(actual.summary), \(inputNote))." + fallbackNote
+                } else {
+                    if let vd = createdVD, self.virtualDisplay === vd { self.virtualDisplay = nil }
+                    capture.stop()
+                }
             } catch {
+                if let vd = createdVD, self.virtualDisplay === vd { self.virtualDisplay = nil }
                 guard self.host.active === p, self.capture === capture else { return }
                 p.close(); self.statusText = "화면 캡처 실패. 화면 기록 권한과 로그인 상태를 확인하세요."
             }
@@ -476,7 +564,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard data.first == 2, data.count <= 100_000, let m = try? JSONDecoder().decode(InputMessage.self, from: data.dropFirst()), m.valid,
               m.kind == .gesture || data.count <= 2048 else { p.close(); return }
         if m.kind == .release { injector.release(); return }
-        guard allow.state == .on && AXIsProcessTrusted() else { return }
+        guard hostAllowsInput(peerKind: p.kind, guestInputAllowed: guestInput.state == .on, accessibilityTrusted: AXIsProcessTrusted()) else { return }
         if m.kind == .gesture && m.build != osBuild {
             if !gestureNoted { gestureNoted = true; statusText = "두 Mac의 macOS 빌드가 달라 트랙패드 제스처를 무시합니다." }
             return
@@ -501,7 +589,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         outbound = p
         p.onReady = { [weak self, weak p] in
             guard let self, let p else { return }
-            let req = StreamQualityPreferences.load().request(hevcDecode: VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC))
+            let prefs = StreamQualityPreferences.load()
+            let vd = VirtualDisplayRequest.forScreen(self.window.screen ?? NSScreen.main, enabled: prefs.useVirtualDisplay)
+            let req = prefs.request(hevcDecode: VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC), virtualDisplay: vd)
             p.send(req.wireMessage())
             self.session.connected()
             self.statusText = (p.greet ? "Tailscale로 연결됨." : "암호화 연결됨.") + " 화면을 클릭해 입력하세요. Command+Option+Escape는 긴급 중지입니다." + (AXIsProcessTrusted() ? "" : " 시스템 단축키와 제스처 전달에는 이 Mac의 기기 제어 및 데이터 접근과 입력 모니터링 권한이 필요합니다.")
@@ -548,7 +638,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         qualityWait?.cancel(); qualityWait = nil; awaitedPeer = nil
         hosting = false; listener?.cancel(); listener = nil; tailnetListener?.cancel(); tailnetListener = nil; tailnetState.stringValue = "꺼짐"
         host.closeAll()
-        capture?.stop(); capture = nil; injector.release(); token = nil; secret = nil
+        capture?.stop(); capture = nil; virtualDisplay = nil; injector.release(); token = nil; secret = nil
         refreshHostState(); statusText = "공유를 중지했습니다."
     }
     @objc func stopAll() { stopHost(); disconnectViewer(); statusText = "모든 연결을 중지했습니다. 새로 공유하면 새 비밀키를 만듭니다." }
