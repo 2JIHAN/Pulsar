@@ -515,6 +515,6 @@ func uiModelTests() {
     precondition(ShortcutAction.fullScreen.conflict(ShortcutAction.disconnect.fallback, defaults) == .disconnect && ShortcutAction.disconnect.conflict(custom, defaults) == .overlay)
     precondition(ShortcutAction.disconnect.conflict(ShortcutAction.disconnect.fallback, defaults) == nil && ShortcutAction.disconnect.conflict(Shortcut.from(combo)!, defaults) == nil)
     print("PASS saved session shortcuts consumed locally (⌃⌥⇧Q, ⌃⌥⌘F, custom ⇧⌘E), other combos and keyUp forwarded; recorder rejects a combo used by another action")
-    precondition(Permission.all.map(\.verifiable) == [true, true, false])
-    print("PASS input monitoring marked non-verifiable so it displays manual check and is excluded from missing-permission banner")
+    precondition(Permission.all.map(\.verifiable) == [true, true, true])
+    print("PASS all three permissions report usable/not usable and count toward the missing-permission line")
 }

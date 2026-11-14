@@ -20,7 +20,7 @@ struct Permission {
                    granted: { AXIsProcessTrusted() },
                    request: { _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary) }),
         Permission(title: "입력 모니터링", use: "뷰어: 단축키와 트랙패드 제스처 전달",
-                   pane: "Privacy_ListenEvent", verifiable: false,
+                   pane: "Privacy_ListenEvent", verifiable: true,
                    granted: { IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted },
                    request: { _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent) }),
     ]
