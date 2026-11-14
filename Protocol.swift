@@ -30,7 +30,7 @@ struct ConnectionCode: Codable {
     }
 }
 struct PacketParser {
-    static let limit = 4 * 1024 * 1024
+    static let limit = 8 * 1024 * 1024
     var buffer = Data()
     mutating func feed(_ bytes: Data) throws -> [Data] {
         guard buffer.count + bytes.count <= Self.limit + 65540 else { throw WireError.invalid }
@@ -350,27 +350,179 @@ func localAddresses() -> [(String, String)] {
     return result
 }
 
-// Message type 4: [4][flags: 1 = keyframe][keyframe only: UInt16 BE length + SPS, UInt16 BE length + PPS]
-// [one access unit as AVCC NAL units, each prefixed by a UInt32 BE length].
+enum CodecPreference: String, Codable, CaseIterable {
+    case auto, h264, hevc
+}
+enum ResolvedCodec: String, Codable, CaseIterable {
+    case h264, hevc
+    var label: String { self == .hevc ? "HEVC" : "H.264" }
+}
+enum ChromaOption: String, Codable, CaseIterable {
+    case yuv420 = "420"
+    case yuv444 = "444"
+}
+enum BitrateOption: Int, Codable, CaseIterable {
+    case auto = 0
+    case mbps5 = 5
+    case mbps10 = 10
+    case mbps20 = 20
+    case mbps35 = 35
+    case mbps50 = 50
+    var mbps: Int { self == .auto ? 8 : rawValue }
+    static let allowedMbps = Set([5, 8, 10, 20, 35, 50])
+}
+enum MaxResolutionOption: String, Codable, CaseIterable {
+    case p1080 = "1080p"
+    case p1440 = "1440p"
+    case native = "native"
+    var label: String {
+        switch self {
+        case .p1080: return "1080p"
+        case .p1440: return "1440p"
+        case .native: return "원본"
+        }
+    }
+    var maxBounds: (width: Double, height: Double) {
+        switch self {
+        case .p1080: return (1920, 1080)
+        case .p1440: return (2560, 1440)
+        case .native: return (3840, 2400)
+        }
+    }
+    func scaledSize(displayWidth: Double, displayHeight: Double) -> (width: Int, height: Int) {
+        Self.scaledSize(displayWidth: displayWidth, displayHeight: displayHeight, bounds: maxBounds)
+    }
+    static func scaledSize(displayWidth: Double, displayHeight: Double, bounds: (width: Double, height: Double)) -> (width: Int, height: Int) {
+        let w = max(2, displayWidth), h = max(2, displayHeight)
+        let scale = min(1, min(bounds.width / w, bounds.height / h))
+        return (max(2, Int(w * scale) / 2 * 2), max(2, Int(h * scale) / 2 * 2))
+    }
+}
+enum FPSOption: Int, Codable, CaseIterable {
+    case fps30 = 30
+    case fps60 = 60
+}
+
+struct StreamQualityPreferences: Equatable {
+    var codec: CodecPreference = .auto
+    var chroma: ChromaOption = .yuv420
+    var bitrate: BitrateOption = .auto
+    var maxResolution: MaxResolutionOption = .p1080
+    var fps: FPSOption = .fps30
+
+    private static let codecKey = "quality.codec"
+    private static let chromaKey = "quality.chroma"
+    private static let bitrateKey = "quality.bitrate"
+    private static let resolutionKey = "quality.maxResolution"
+    private static let fpsKey = "quality.fps"
+
+    static func load(_ d: UserDefaults = .standard) -> StreamQualityPreferences {
+        var p = StreamQualityPreferences()
+        if let raw = d.string(forKey: codecKey), let v = CodecPreference(rawValue: raw) { p.codec = v }
+        if let raw = d.string(forKey: chromaKey), let v = ChromaOption(rawValue: raw) { p.chroma = v }
+        if d.object(forKey: bitrateKey) != nil, let v = BitrateOption(rawValue: d.integer(forKey: bitrateKey)) { p.bitrate = v }
+        if let raw = d.string(forKey: resolutionKey), let v = MaxResolutionOption(rawValue: raw) { p.maxResolution = v }
+        if d.object(forKey: fpsKey) != nil, let v = FPSOption(rawValue: d.integer(forKey: fpsKey)) { p.fps = v }
+        return p
+    }
+    func save(_ d: UserDefaults = .standard) {
+        d.set(codec.rawValue, forKey: Self.codecKey)
+        d.set(chroma.rawValue, forKey: Self.chromaKey)
+        d.set(bitrate.rawValue, forKey: Self.bitrateKey)
+        d.set(maxResolution.rawValue, forKey: Self.resolutionKey)
+        d.set(fps.rawValue, forKey: Self.fpsKey)
+    }
+    func request(hevcDecode: Bool) -> QualityRequest {
+        QualityRequest(codec: codec, chroma: codec == .h264 ? .yuv420 : chroma, bitrate: bitrate, maxResolution: maxResolution, fps: fps, hevcDecode: hevcDecode)
+    }
+}
+
+struct QualityRequest: Codable, Equatable {
+    static let messageType: UInt8 = 5
+    static let maxWireBytes = 512
+    var codec: CodecPreference
+    var chroma: ChromaOption
+    var bitrate: BitrateOption
+    var maxResolution: MaxResolutionOption
+    var fps: FPSOption
+    var hevcDecode: Bool
+
+    func wireMessage() -> Data {
+        let json = (try? JSONEncoder().encode(self)) ?? Data()
+        return Data([Self.messageType]) + json
+    }
+    static func decodeWire(_ data: Data) -> QualityRequest? {
+        guard data.first == messageType, data.count > 1, data.count <= maxWireBytes else { return nil }
+        return try? JSONDecoder().decode(QualityRequest.self, from: data.dropFirst())
+    }
+}
+
+struct EffectiveQuality: Codable, Equatable {
+    static let messageType: UInt8 = 6
+    static let maxWireBytes = 512
+    var codec: ResolvedCodec
+    var chroma: ChromaOption
+    var bitrateMbps: Int
+    var maxResolution: MaxResolutionOption
+    var fps: FPSOption
+
+    static let legacyDefaults = EffectiveQuality(codec: .h264, chroma: .yuv420, bitrateMbps: 8, maxResolution: .p1080, fps: .fps30)
+
+    var summary: String {
+        let codecPart = chroma == .yuv444 ? "\(codec.label) 4:4:4" : codec.label
+        return "\(codecPart) · \(maxResolution.label) · \(fps.rawValue)fps · \(bitrateMbps)Mbps"
+    }
+
+    static func resolve(_ req: QualityRequest, hostHEVCEncode: Bool, hostHEVC444Encode: Bool = true) -> EffectiveQuality {
+        let canHEVC = hostHEVCEncode && req.hevcDecode
+        let resolvedCodec: ResolvedCodec = (req.codec != .h264 && canHEVC) ? .hevc : .h264
+        let resolvedChroma: ChromaOption = (resolvedCodec == .hevc && req.chroma == .yuv444 && hostHEVC444Encode) ? .yuv444 : .yuv420
+        let mbps = BitrateOption.allowedMbps.contains(req.bitrate.mbps) ? req.bitrate.mbps : 8
+        return EffectiveQuality(codec: resolvedCodec, chroma: resolvedChroma, bitrateMbps: mbps, maxResolution: req.maxResolution, fps: req.fps)
+    }
+
+    func wireMessage() -> Data {
+        let json = (try? JSONEncoder().encode(self)) ?? Data()
+        return Data([Self.messageType]) + json
+    }
+    static func decodeWire(_ data: Data) -> EffectiveQuality? {
+        guard data.first == messageType, data.count > 1, data.count <= maxWireBytes,
+              let q = try? JSONDecoder().decode(EffectiveQuality.self, from: data.dropFirst()),
+              BitrateOption.allowedMbps.contains(q.bitrateMbps),
+              !(q.codec == .h264 && q.chroma == .yuv444) else { return nil }
+        return q
+    }
+}
+
+// Message type 4: [4][flags: bit 0 = keyframe, bit 1 = HEVC][keyframe only: UInt16 BE length + parameter sets (H.264: SPS,PPS; HEVC: VPS,SPS,PPS)]
+// [one access unit as AVCC/HVCC NAL units, each prefixed by a UInt32 BE length].
 struct VideoFrame: Equatable {
+    var codec: ResolvedCodec = .h264
     var keyframe: Bool
     var parameterSets: [Data]
     var avcc: Data
     var message: Data {
-        var data = Data([4, keyframe ? 1 : 0])
+        let flags: UInt8 = (keyframe ? 1 : 0) | (codec == .hevc ? 2 : 0)
+        var data = Data([4, flags])
         for p in parameterSets { data += [UInt8(p.count >> 8), UInt8(p.count & 0xff)] + p }
         return data + avcc
     }
     static func parse(_ data: Data) throws -> VideoFrame {
         let b = [UInt8](data)
-        guard b.count >= 7, b.count <= PacketParser.limit, b[0] == 4, b[1] <= 1 else { throw WireError.invalid }
+        guard b.count >= 7, b.count <= PacketParser.limit, b[0] == 4, b[1] <= 3 else { throw WireError.invalid }
+        let keyframe = (b[1] & 1) != 0
+        let codec: ResolvedCodec = (b[1] & 2) != 0 ? .hevc : .h264
         var i = 2
         var parameterSets = [Data]()
-        if b[1] == 1 {
-            for type: UInt8 in [7, 8] {
+        if keyframe {
+            let expectedTypes: [UInt8] = codec == .hevc ? [32, 33, 34] : [7, 8]
+            for type in expectedTypes {
                 guard i + 2 <= b.count else { throw WireError.invalid }
                 let n = Int(b[i]) << 8 | Int(b[i + 1]); i += 2
-                guard n > 0, n <= 1024, n <= b.count - i, b[i] & 0x1f == type else { throw WireError.invalid }
+                let minLen = codec == .hevc ? 2 : 1
+                guard n >= minLen, n <= 1024, n <= b.count - i else { throw WireError.invalid }
+                let nalType = codec == .hevc ? (b[i] >> 1) & 0x3f : b[i] & 0x1f
+                guard nalType == type else { throw WireError.invalid }
                 parameterSets.append(Data(b[i..<i + n])); i += n
             }
         }
@@ -384,24 +536,31 @@ struct VideoFrame: Equatable {
             guard n > 0, n <= b.count - i, units <= 256 else { throw WireError.invalid }
             i += n
         }
-        return VideoFrame(keyframe: b[1] == 1, parameterSets: parameterSets, avcc: Data(b[start...]))
+        return VideoFrame(codec: codec, keyframe: keyframe, parameterSets: parameterSets, avcc: Data(b[start...]))
     }
 }
 // Encoder output -> wire message. Returns nil for anything the viewer parser would reject.
-func videoMessage(_ sample: CMSampleBuffer) -> Data? {
+func videoMessage(_ sample: CMSampleBuffer, codec: ResolvedCodec = .h264) -> Data? {
     guard let block = CMSampleBufferGetDataBuffer(sample), let format = CMSampleBufferGetFormatDescription(sample) else { return nil }
     let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[CFString: Any]]
     let keyframe = attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool != true
     var count = 0
     var headerLength: Int32 = 0
-    guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: 0, parameterSetPointerOut: nil, parameterSetSizeOut: nil, parameterSetCountOut: &count, nalUnitHeaderLengthOut: &headerLength) == noErr, headerLength == 4 else { return nil }
+    let expectedCount = codec == .hevc ? 3 : 2
+    let metaStatus: OSStatus = codec == .hevc
+        ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(format, parameterSetIndex: 0, parameterSetPointerOut: nil, parameterSetSizeOut: nil, parameterSetCountOut: &count, nalUnitHeaderLengthOut: &headerLength)
+        : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: 0, parameterSetPointerOut: nil, parameterSetSizeOut: nil, parameterSetCountOut: &count, nalUnitHeaderLengthOut: &headerLength)
+    guard metaStatus == noErr, headerLength == 4 else { return nil }
     var parameterSets = [Data]()
     if keyframe {
-        guard count == 2 else { return nil }
+        guard count == expectedCount else { return nil }
         for index in 0..<count {
             var pointer: UnsafePointer<UInt8>?
             var size = 0
-            guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: index, parameterSetPointerOut: &pointer, parameterSetSizeOut: &size, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil) == noErr, let pointer else { return nil }
+            let s: OSStatus = codec == .hevc
+                ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(format, parameterSetIndex: index, parameterSetPointerOut: &pointer, parameterSetSizeOut: &size, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil)
+                : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: index, parameterSetPointerOut: &pointer, parameterSetSizeOut: &size, parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil)
+            guard s == noErr, let pointer else { return nil }
             parameterSets.append(Data(bytes: pointer, count: size))
         }
     }
@@ -409,20 +568,30 @@ func videoMessage(_ sample: CMSampleBuffer) -> Data? {
     guard length > 0, length <= PacketParser.limit else { return nil }
     var avcc = Data(count: length)
     guard avcc.withUnsafeMutableBytes({ CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!) }) == noErr else { return nil }
-    let message = VideoFrame(keyframe: keyframe, parameterSets: parameterSets, avcc: avcc).message
+    let message = VideoFrame(codec: codec, keyframe: keyframe, parameterSets: parameterSets, avcc: avcc).message
     return (try? VideoFrame.parse(message)) == nil ? nil : message
 }
 // Validates dimensions from the SPS before anything is decoded.
 func videoFormat(_ frame: VideoFrame) -> CMVideoFormatDescription? {
-    guard frame.parameterSets.count == 2 else { return nil }
-    let sps = frame.parameterSets[0], pps = frame.parameterSets[1]
     var format: CMFormatDescription?
-    let status = sps.withUnsafeBytes { s in pps.withUnsafeBytes { p in
-        CMVideoFormatDescriptionCreateFromH264ParameterSets(allocator: kCFAllocatorDefault, parameterSetCount: 2, parameterSetPointers: [s.bindMemory(to: UInt8.self).baseAddress!, p.bindMemory(to: UInt8.self).baseAddress!], parameterSetSizes: [sps.count, pps.count], nalUnitHeaderLength: 4, formatDescriptionOut: &format)
-    } }
+    let status: OSStatus
+    switch frame.codec {
+    case .h264:
+        guard frame.parameterSets.count == 2 else { return nil }
+        let sps = frame.parameterSets[0], pps = frame.parameterSets[1]
+        status = sps.withUnsafeBytes { s in pps.withUnsafeBytes { p in
+            CMVideoFormatDescriptionCreateFromH264ParameterSets(allocator: kCFAllocatorDefault, parameterSetCount: 2, parameterSetPointers: [s.bindMemory(to: UInt8.self).baseAddress!, p.bindMemory(to: UInt8.self).baseAddress!], parameterSetSizes: [sps.count, pps.count], nalUnitHeaderLength: 4, formatDescriptionOut: &format)
+        } }
+    case .hevc:
+        guard frame.parameterSets.count == 3 else { return nil }
+        let vps = frame.parameterSets[0], sps = frame.parameterSets[1], pps = frame.parameterSets[2]
+        status = vps.withUnsafeBytes { v in sps.withUnsafeBytes { s in pps.withUnsafeBytes { p in
+            CMVideoFormatDescriptionCreateFromHEVCParameterSets(allocator: kCFAllocatorDefault, parameterSetCount: 3, parameterSetPointers: [v.bindMemory(to: UInt8.self).baseAddress!, s.bindMemory(to: UInt8.self).baseAddress!, p.bindMemory(to: UInt8.self).baseAddress!], parameterSetSizes: [vps.count, sps.count, pps.count], nalUnitHeaderLength: 4, extensions: nil, formatDescriptionOut: &format)
+        } } }
+    }
     guard status == noErr, let format else { return nil }
     let size = CMVideoFormatDescriptionGetDimensions(format)
-    guard size.width >= 2, size.width <= 1920, size.height >= 2, size.height <= 1200 else { return nil }
+    guard size.width >= 2, size.width <= 3840, size.height >= 2, size.height <= 2400 else { return nil }
     return format
 }
 func videoSample(_ frame: VideoFrame, format: CMVideoFormatDescription) -> CMSampleBuffer? {

@@ -3,6 +3,7 @@ import Network
 import ApplicationServices
 import AVFoundation
 import Carbon
+import VideoToolbox
 
 @_silgen_name("CGSMainConnectionID") private func CGSMainConnectionID() -> Int32
 @_silgen_name("CGSSetGlobalHotKeyOperatingMode") private func CGSSetGlobalHotKeyOperatingMode(_ cid: Int32, _ mode: Int32) -> Int32
@@ -156,6 +157,8 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var frames = 0, bytes = 0
     var gestureNoted = false
     var capture: Capture?
+    var qualityWait: DispatchWorkItem?
+    weak var awaitedPeer: Peer?
     let injector = InputInjector()
     var timer: Timer?
     var uiTimer: Timer?
@@ -202,9 +205,10 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             return nil
         }
-        host.onActive = { [weak self] p in self?.startCapture(for: p) }
+        host.onActive = { [weak self] p in self?.awaitQuality(for: p) }
         host.onInactive = { [weak self] in
             guard let self else { return }
+            self.qualityWait?.cancel(); self.qualityWait = nil; self.awaitedPeer = nil
             self.capture?.stop(); self.capture = nil; self.injector.release(); self.statusText = "연결 해제됨. 공유는 대기 중입니다."
         }
         host.onPacket = { [weak self] p, data in self?.hostPacket(p, data) }
@@ -344,15 +348,18 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         frames = 0; bytes = 0
         if !inSession {
             inSession = true; settings.stopRecording()
+            sessionView.setQuality("")
             split.splitViewItems[0].isCollapsed = true
             sessionView.isHidden = false
         }
+        settings.setConnected(true)
         sessionView.live(peer: peerName, metrics: "측정 중")
         sessionView.flash(3)
     }
     func leaveSession() {
         guard inSession else { return }
         inSession = false; sessionView.pinned = false; sessionView.setBoard(false)
+        sessionView.setQuality(""); settings.setConnected(false)
         sessionView.isHidden = true
         split.splitViewItems[0].isCollapsed = false
         select(returnPage)
@@ -423,19 +430,48 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             DispatchQueue.main.async { done(ok) }
         }
     }
-    func startCapture(for p: Peer) {
+    func awaitQuality(for p: Peer) {
+        qualityWait?.cancel(); qualityWait = nil
+        awaitedPeer = p
+        statusText = (p.greet ? "Tailscale로 연결됨." : "암호화 연결됨.") + " 화면 품질 확인 중…"
+        let work = DispatchWorkItem { [weak self, weak p] in
+            guard let self, let p, self.host.active === p, self.awaitedPeer === p, self.capture == nil else { return }
+            self.awaitedPeer = nil; self.qualityWait = nil
+            self.startCapture(for: p, request: nil)
+        }
+        qualityWait = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
+    }
+    func startCapture(for p: Peer, request: QualityRequest?) {
         gestureNoted = false
-        statusText = (p.greet ? "Tailscale로 연결됨." : "암호화 연결됨.") + " 화면 전송 중. 원격 입력은 설정 > 일반에서 제어합니다."
+        let sendEffective = request != nil
+        let prefix = p.greet ? "Tailscale로 연결됨." : "암호화 연결됨."
+        statusText = prefix + " 화면 전송 중. 원격 입력은 설정 > 일반에서 제어합니다."
         let capture = Capture(); self.capture = capture
         capture.onFrame = { [weak self, weak p, weak capture] data, sent in guard let self = self, let capture = capture, self.host.active === p, self.capture === capture else { return }; p?.frame(data, sent: sent) }
         capture.onError = { [weak self, weak p] message in guard let self = self, self.host.active === p else { return }; p?.close(); self.statusText = message }
         Task { @MainActor in
-            do { try await capture.start(); if self.host.active === p { self.injector.rect = capture.rect } else { capture.stop() } }
-            catch { guard self.host.active === p, self.capture === capture else { return }; p.close(); self.statusText = "화면 캡처 실패. 화면 기록 권한과 로그인 상태를 확인하세요." }
+            do {
+                let actual = try await capture.start(request: request)
+                if self.host.active === p, self.capture === capture {
+                    self.injector.rect = capture.rect
+                    if sendEffective { p.send(actual.wireMessage()) }
+                    self.statusText = prefix + " 화면 전송 중 (\(actual.summary)). 원격 입력은 설정 > 일반에서 제어합니다."
+                } else { capture.stop() }
+            } catch {
+                guard self.host.active === p, self.capture === capture else { return }
+                p.close(); self.statusText = "화면 캡처 실패. 화면 기록 권한과 로그인 상태를 확인하세요."
+            }
         }
     }
     func hostPacket(_ p: Peer, _ data: Data) {
         if data == Data([3]) { return }
+        if data.first == QualityRequest.messageType {
+            guard awaitedPeer === p, capture == nil, let req = QualityRequest.decodeWire(data) else { p.close(); return }
+            qualityWait?.cancel(); qualityWait = nil; awaitedPeer = nil
+            startCapture(for: p, request: req)
+            return
+        }
         // Malformed messages close the connection; a well-formed gesture the host cannot replay is ignored.
         guard data.first == 2, data.count <= 100_000, let m = try? JSONDecoder().decode(InputMessage.self, from: data.dropFirst()), m.valid,
               m.kind == .gesture || data.count <= 2048 else { p.close(); return }
@@ -463,8 +499,10 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let t = session.target else { return }
         let p = Peer(NWConnection(host: NWEndpoint.Host(t.host), port: NWEndpoint.Port(rawValue: t.port)!, using: t.secret.map(tlsParameters) ?? .tcp), greet: t.secret == nil)
         outbound = p
-        p.onReady = { [weak self] in
-            guard let self else { return }
+        p.onReady = { [weak self, weak p] in
+            guard let self, let p else { return }
+            let req = StreamQualityPreferences.load().request(hevcDecode: VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC))
+            p.send(req.wireMessage())
             self.session.connected()
             self.statusText = (p.greet ? "Tailscale로 연결됨." : "암호화 연결됨.") + " 화면을 클릭해 입력하세요. Command+Option+Escape는 긴급 중지입니다." + (AXIsProcessTrusted() ? "" : " 시스템 단축키와 제스처 전달에는 이 Mac의 기기 제어 및 데이터 접근과 입력 모니터링 권한이 필요합니다.")
             self.enterSession()
@@ -472,7 +510,14 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         p.onPacket = { [weak self, weak p] data in
             if data == Data([3]) { return }
-            guard let self = self, let frame = try? VideoFrame.parse(data), self.viewer.show(frame) else { p?.close(); return }
+            guard let self = self else { return }
+            if data.first == EffectiveQuality.messageType {
+                guard let eff = EffectiveQuality.decodeWire(data) else { p?.close(); return }
+                self.sessionView.setQuality(eff.summary)
+                self.settings.setLastEffective(eff.summary)
+                return
+            }
+            guard let frame = try? VideoFrame.parse(data), self.viewer.show(frame) else { p?.close(); return }
             self.frames += 1; self.bytes += data.count
         }
         // The last frame stays on screen while redialing.
@@ -500,6 +545,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var forwardingKeys: Bool { outbound?.ready == true && window.isKeyWindow && window.firstResponder === viewer }
     func updateHotKeys() { hotKeys.set(forwardingKeys && NSApp.isActive && AXIsProcessTrusted() && ShortcutAction.sendsSystem()) }
     func stopHost() {
+        qualityWait?.cancel(); qualityWait = nil; awaitedPeer = nil
         hosting = false; listener?.cancel(); listener = nil; tailnetListener?.cancel(); tailnetListener = nil; tailnetState.stringValue = "꺼짐"
         host.closeAll()
         capture?.stop(); capture = nil; injector.release(); token = nil; secret = nil

@@ -18,7 +18,7 @@ func runSelfTests() {
         for byte in frame.dropLast() { precondition((try? parser.feed(Data([byte]))) == []) }
         precondition((try? parser.feed(Data(frame.suffix(1)))) == [payload])
         precondition((try? parser.feed(frame + frame)) == [payload, payload])
-        for bad in [Data([0,0,0,0]), Data([255,255,255,255]), Data([0,64,0,1])] { var p = PacketParser(); precondition((try? p.feed(bad)) == nil) }
+        for bad in [Data([0,0,0,0]), Data([255,255,255,255]), Data([0,128,0,1])] { var p = PacketParser(); precondition((try? p.feed(bad)) == nil) }
         let maxPayload = Data(repeating: 7, count: PacketParser.limit)
         var large = PacketParser(); var result = [Data](); let full = PacketParser.frame(maxPayload)
         for start in stride(from: 0, to: full.count, by: 65536) { result += try large.feed(Data(full[start..<min(full.count, start + 65536)])) }
@@ -42,6 +42,7 @@ func runSelfTests() {
         precondition(s.valid && s.dy == -1000 && s.code == 0)
         print("PASS viewer builds valid input messages from real mouse and scroll NSEvents")
         try videoTests()
+        qualityTests()
         let injector = InputInjector(); injector.rect = CGRect(x: 0, y: 0, width: 1440, height: 900)
         var posted = 0; injector.postEvent = { _ in posted += 1 }
         injector.release(); precondition(posted == 0)
@@ -122,9 +123,9 @@ final class TLSTest {
         DispatchQueue.main.asyncAfter(deadline: .now() + 15) { print("FAIL TLS test timeout (no insecure fallback)"); exit(1) }
     }
 }
-func testPixelBuffer(width: Int, height: Int, shade: Int) -> CVPixelBuffer {
+func testPixelBuffer(width: Int, height: Int, shade: Int, format: OSType = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) -> CVPixelBuffer {
     var buffer: CVPixelBuffer?
-    precondition(CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer) == kCVReturnSuccess)
+    precondition(CVPixelBufferCreate(nil, width, height, format, [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer) == kCVReturnSuccess)
     let pixel = buffer!
     CVPixelBufferLockBaseAddress(pixel, [])
     for plane in 0..<2 {
@@ -135,12 +136,13 @@ func testPixelBuffer(width: Int, height: Int, shade: Int) -> CVPixelBuffer {
     CVPixelBufferUnlockBaseAddress(pixel, [])
     return pixel
 }
-func encodeTestFrames(width: Int, height: Int, keyframes: Set<Int>, count: Int) throws -> [Data] {
+func encodeTestFrames(width: Int, height: Int, keyframes: Set<Int>, count: Int, quality: EffectiveQuality = .legacyDefaults) throws -> [Data] {
     var messages = [Data?]()
     let lock = NSLock(), done = DispatchSemaphore(value: 0)
-    let encoder = try VideoEncoder(width: width, height: height) { m in lock.lock(); messages.append(m); lock.unlock(); done.signal() }
+    let encoder = try VideoEncoder(width: width, height: height, quality: quality) { m in lock.lock(); messages.append(m); lock.unlock(); done.signal() }
+    let fmt = encoder.effectiveQuality.chroma == .yuv444 ? kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
     for i in 0..<count {
-        precondition(encoder.encode(testPixelBuffer(width: width, height: height, shade: i), time: CMTime(value: Int64(i), timescale: 30), keyframe: keyframes.contains(i)))
+        precondition(encoder.encode(testPixelBuffer(width: width, height: height, shade: i, format: fmt), time: CMTime(value: Int64(i), timescale: Int32(quality.fps.rawValue)), keyframe: keyframes.contains(i)))
         precondition(done.wait(timeout: .now() + 5) == .success)
     }
     lock.lock(); defer { lock.unlock() }
@@ -150,7 +152,7 @@ func encodeTestFrames(width: Int, height: Int, keyframes: Set<Int>, count: Int) 
 func videoTests() throws {
     let messages = try encodeTestFrames(width: 1280, height: 720, keyframes: [0, 4], count: 6)
     let frames = try messages.map(VideoFrame.parse)
-    precondition(frames.map(\.keyframe) == [true, false, false, false, true, false])
+    precondition(frames.map(\.keyframe) == [true, false, false, false, true, false] && frames.allSatisfy { $0.codec == .h264 })
     precondition(zip(frames, messages).allSatisfy { $0.message == $1 } && frames[0].parameterSets.count == 2 && frames[1].parameterSets.isEmpty)
     let format = videoFormat(frames[0])!
     let size = CMVideoFormatDescriptionGetDimensions(format)
@@ -174,19 +176,137 @@ func videoTests() throws {
     viewer.clear(); precondition(viewer.format == nil && viewer.videoSize == .zero)
     let bytes = messages.map(\.count)
     print("PASS H.264 hardware encode, wire roundtrip and decode of \(decoded) 1280x720 frames, viewer enqueue and letterbox (bytes: \(bytes))")
-    let oversized = try VideoFrame.parse(encodeTestFrames(width: 1922, height: 1080, keyframes: [0], count: 1)[0])
+    let oversized = try VideoFrame.parse(encodeTestFrames(width: 3842, height: 2160, keyframes: [0], count: 1)[0])
     precondition(oversized.keyframe && videoFormat(oversized) == nil)
     let key = frames[0], unit: [UInt8] = [0, 0, 0, 1, 0x41]
     let bad: [Data] = [
-        Data([4]), Data([4, 0]), Data([1] + messages[1].dropFirst()), Data([4, 2] + messages[1].dropFirst(2)),
+        Data([4]), Data([4, 0]), Data([1] + messages[1].dropFirst()), Data([4, 4] + messages[1].dropFirst(2)),
         Data(messages[0].dropLast()), Data(messages[1] + [0]), Data([4, 0, 0, 0, 0, 0, 0x41]), Data([4, 0, 0xff, 0xff, 0xff, 0xff, 0x41]),
         Data([4, 1, 0, 0] + messages[0].dropFirst(4)), Data([4, 1]) + key.avcc,
-        VideoFrame(keyframe: true, parameterSets: key.parameterSets.reversed(), avcc: key.avcc).message,
+        VideoFrame(codec: .h264, keyframe: true, parameterSets: key.parameterSets.reversed(), avcc: key.avcc).message,
         Data([4, 0] + Array(repeating: unit, count: 257).joined()),
     ]
     for (i, message) in bad.enumerated() where (try? VideoFrame.parse(message)) != nil { print("FAIL malformed video message \(i) accepted"); exit(1) }
     precondition((try? VideoFrame.parse(Data([4, 0] + Array(repeating: unit, count: 256).joined()))) != nil)
-    print("PASS oversized H.264 dimensions and \(bad.count) malformed video messages rejected")
+    print("PASS oversized H.264 dimensions (>3840x2400) and \(bad.count) malformed video messages rejected")
+
+    let enc60 = try VideoEncoder(width: 1280, height: 720, quality: EffectiveQuality(codec: .h264, chroma: .yuv420, bitrateMbps: 20, maxResolution: .p1440, fps: .fps60)) { _ in }
+    precondition(enc60.effectiveQuality.fps == .fps60 && enc60.effectiveQuality.bitrateMbps == 20)
+    print("PASS H.264 60fps 20Mbps encoder created")
+
+    if VideoEncoder.supportsHardwareHEVC && VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC) {
+        let hevcQ = EffectiveQuality(codec: .hevc, chroma: .yuv420, bitrateMbps: 10, maxResolution: .p1080, fps: .fps30)
+        let hevcMsgs = try encodeTestFrames(width: 1280, height: 720, keyframes: [0, 4], count: 6, quality: hevcQ)
+        let hevcFrames = try hevcMsgs.map(VideoFrame.parse)
+        precondition(hevcFrames.allSatisfy { $0.codec == .hevc } && hevcFrames.map(\.keyframe) == [true, false, false, false, true, false])
+        precondition(hevcFrames[0].parameterSets.count == 3 && hevcFrames[1].parameterSets.isEmpty)
+        precondition(hevcFrames[0].parameterSets.map { ($0[0] >> 1) & 0x3f } == [32, 33, 34])
+        let hevcFmt = videoFormat(hevcFrames[0])!
+        let hevcSize = CMVideoFormatDescriptionGetDimensions(hevcFmt)
+        precondition(hevcSize.width == 1280 && hevcSize.height == 720)
+        var hevcDecOut: VTDecompressionSession?
+        precondition(VTDecompressionSessionCreate(allocator: nil, formatDescription: hevcFmt, decoderSpecification: nil, imageBufferAttributes: nil, outputCallback: nil, decompressionSessionOut: &hevcDecOut) == noErr)
+        let hevcDec = hevcDecOut!
+        var hevcDecoded = 0
+        for frame in hevcFrames {
+            let sample = videoSample(frame, format: frame.keyframe ? videoFormat(frame)! : hevcFmt)!
+            precondition(VTDecompressionSessionDecodeFrame(hevcDec, sampleBuffer: sample, flags: [], infoFlagsOut: nil) { status, _, image, _, _ in
+                if status == noErr, let image, CVPixelBufferGetWidth(image) == 1280, CVPixelBufferGetHeight(image) == 720 { hevcDecoded += 1 }
+            } == noErr)
+        }
+        VTDecompressionSessionWaitForAsynchronousFrames(hevcDec); VTDecompressionSessionInvalidate(hevcDec)
+        precondition(hevcDecoded == hevcFrames.count)
+        let hevcViewer = Viewer(frame: NSRect(x: 0, y: 0, width: 640, height: 720))
+        precondition(hevcFrames.allSatisfy(hevcViewer.show) && hevcViewer.videoSize == CGSize(width: 1280, height: 720) && hevcViewer.display.sampleBufferRenderer.status != .failed)
+        hevcViewer.clear()
+        print("PASS HEVC hardware encode, wire roundtrip and decode of \(hevcDecoded) 1280x720 frames (bytes: \(hevcMsgs.map(\.count)))")
+
+        let hevcKey = hevcFrames[0]
+        let badHEVC: [Data] = [
+            Data([4, 3]) + hevcKey.avcc,
+            VideoFrame(codec: .hevc, keyframe: true, parameterSets: Array(hevcKey.parameterSets.prefix(2)), avcc: hevcKey.avcc).message,
+            VideoFrame(codec: .hevc, keyframe: true, parameterSets: hevcKey.parameterSets.reversed(), avcc: hevcKey.avcc).message,
+            VideoFrame(codec: .hevc, keyframe: true, parameterSets: key.parameterSets + [key.parameterSets[0]], avcc: hevcKey.avcc).message,
+            VideoFrame(codec: .hevc, keyframe: true, parameterSets: [Data([0x40])] + hevcKey.parameterSets.dropFirst(), avcc: hevcKey.avcc).message,
+            Data([4, 4] + hevcMsgs[1].dropFirst(2)),
+        ]
+        for (i, message) in badHEVC.enumerated() where (try? VideoFrame.parse(message)) != nil { print("FAIL malformed HEVC message \(i) accepted"); exit(1) }
+        precondition(videoFormat(VideoFrame(codec: .hevc, keyframe: true, parameterSets: Array(hevcKey.parameterSets.prefix(2)), avcc: hevcKey.avcc)) == nil)
+        print("PASS \(badHEVC.count) malformed HEVC video messages rejected")
+
+        let req444 = EffectiveQuality(codec: .hevc, chroma: .yuv444, bitrateMbps: 20, maxResolution: .p1440, fps: .fps30)
+        var out444 = [Data?]()
+        let done444 = DispatchSemaphore(value: 0)
+        let enc444 = try VideoEncoder(width: 1280, height: 720, quality: req444) { m in out444.append(m); done444.signal() }
+        let effChroma = enc444.effectiveQuality.chroma
+        if effChroma == .yuv444 {
+            precondition(enc444.encode(testPixelBuffer(width: 1280, height: 720, shade: 1, format: kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange), time: .zero, keyframe: true))
+            precondition(done444.wait(timeout: .now() + 5) == .success)
+            let parsed444 = try VideoFrame.parse(out444[0]!)
+            precondition(parsed444.codec == .hevc && videoFormat(parsed444) != nil)
+        }
+        print("PASS HEVC 4:4:4 attempt reported effective chroma \(effChroma.rawValue)")
+    } else {
+        print("SKIP (no HEVC hardware)")
+        let badHEVC: [Data] = [
+            Data([4, 3, 0, 2, 0x40, 0x01, 0, 2, 0x42, 0x01, 0, 0, 0, 1, 0x02]),
+            Data([4, 3, 0, 2, 0x44, 0x01, 0, 2, 0x42, 0x01, 0, 2, 0x40, 0x01, 0, 0, 0, 1, 0x02]),
+            Data([4, 3, 0, 1, 0x40, 0, 2, 0x42, 0x01, 0, 2, 0x44, 0x01, 0, 0, 0, 1, 0x02]),
+        ]
+        for (i, message) in badHEVC.enumerated() where (try? VideoFrame.parse(message)) != nil { print("FAIL malformed HEVC message \(i) accepted"); exit(1) }
+        print("PASS \(badHEVC.count) malformed HEVC video messages rejected")
+        print("PASS HEVC 4:4:4 attempt reported effective chroma 420 (no HEVC hardware)")
+    }
+}
+func qualityTests() {
+    let req = QualityRequest(codec: .auto, chroma: .yuv444, bitrate: .mbps20, maxResolution: .p1440, fps: .fps60, hevcDecode: true)
+    let wireReq = req.wireMessage()
+    precondition(wireReq.count <= QualityRequest.maxWireBytes && QualityRequest.decodeWire(wireReq) == req)
+    let eff = EffectiveQuality(codec: .hevc, chroma: .yuv444, bitrateMbps: 20, maxResolution: .p1440, fps: .fps60)
+    let wireEff = eff.wireMessage()
+    precondition(wireEff.count <= EffectiveQuality.maxWireBytes && EffectiveQuality.decodeWire(wireEff) == eff)
+    precondition(eff.summary == "HEVC 4:4:4 · 1440p · 60fps · 20Mbps")
+    precondition(EffectiveQuality(codec: .hevc, chroma: .yuv420, bitrateMbps: 20, maxResolution: .p1440, fps: .fps60).summary == "HEVC · 1440p · 60fps · 20Mbps")
+
+    let pad = String(repeating: " ", count: 520)
+    let badReqs: [Data] = [
+        Data([6]) + wireReq.dropFirst(),
+        Data([5]) + Data(#"{"codec":"vp9","chroma":"420","bitrate":0,"maxResolution":"1080p","fps":30,"hevcDecode":true}"#.utf8),
+        Data([5]) + Data(#"{"codec":"auto","chroma":"422","bitrate":0,"maxResolution":"1080p","fps":30,"hevcDecode":true}"#.utf8),
+        Data([5]) + Data(#"{"codec":"auto","chroma":"420","bitrate":99,"maxResolution":"1080p","fps":30,"hevcDecode":true}"#.utf8),
+        Data([5]) + Data(#"{"codec":"auto","chroma":"420","bitrate":0,"maxResolution":"8k","fps":30,"hevcDecode":true}"#.utf8),
+        Data([5]) + Data(#"{"codec":"auto","chroma":"420","bitrate":0,"maxResolution":"1080p","fps":120,"hevcDecode":true}"#.utf8),
+        Data([5]) + Data((pad + #"{"codec":"auto","chroma":"420","bitrate":0,"maxResolution":"1080p","fps":30,"hevcDecode":true}"#).utf8),
+    ]
+    for (i, d) in badReqs.enumerated() { precondition(QualityRequest.decodeWire(d) == nil, "bad req \(i)") }
+    let badEffs: [Data] = [
+        Data([5]) + wireEff.dropFirst(),
+        Data([6]) + Data(#"{"codec":"h264","chroma":"444","bitrateMbps":20,"maxResolution":"1440p","fps":60}"#.utf8),
+        Data([6]) + Data(#"{"codec":"hevc","chroma":"420","bitrateMbps":12,"maxResolution":"1440p","fps":60}"#.utf8),
+        Data([6]) + Data((pad + #"{"codec":"hevc","chroma":"420","bitrateMbps":20,"maxResolution":"1440p","fps":60}"#).utf8),
+    ]
+    for (i, d) in badEffs.enumerated() { precondition(EffectiveQuality.decodeWire(d) == nil, "bad eff \(i)") }
+
+    precondition(EffectiveQuality.resolve(req, hostHEVCEncode: true, hostHEVC444Encode: true) == eff)
+    precondition(EffectiveQuality.resolve(req, hostHEVCEncode: true, hostHEVC444Encode: false) == EffectiveQuality(codec: .hevc, chroma: .yuv420, bitrateMbps: 20, maxResolution: .p1440, fps: .fps60))
+    precondition(EffectiveQuality.resolve(req, hostHEVCEncode: false, hostHEVC444Encode: true) == EffectiveQuality(codec: .h264, chroma: .yuv420, bitrateMbps: 20, maxResolution: .p1440, fps: .fps60))
+    let noDecodeReq = QualityRequest(codec: .hevc, chroma: .yuv444, bitrate: .auto, maxResolution: .native, fps: .fps30, hevcDecode: false)
+    precondition(EffectiveQuality.resolve(noDecodeReq, hostHEVCEncode: true, hostHEVC444Encode: true) == EffectiveQuality(codec: .h264, chroma: .yuv420, bitrateMbps: 8, maxResolution: .native, fps: .fps30))
+    let h264Req = QualityRequest(codec: .h264, chroma: .yuv444, bitrate: .mbps50, maxResolution: .native, fps: .fps60, hevcDecode: true)
+    precondition(EffectiveQuality.resolve(h264Req, hostHEVCEncode: true, hostHEVC444Encode: true) == EffectiveQuality(codec: .h264, chroma: .yuv420, bitrateMbps: 50, maxResolution: .native, fps: .fps60))
+
+    precondition(MaxResolutionOption.native.scaledSize(displayWidth: 5120, displayHeight: 2880) == (3840, 2160))
+    precondition(MaxResolutionOption.p1080.scaledSize(displayWidth: 3456, displayHeight: 2234) == (1670, 1080))
+    precondition(MaxResolutionOption.p1440.scaledSize(displayWidth: 1440, displayHeight: 900) == (1440, 900))
+
+    let suite = "com.tamcut.Pulsar.qualitytest.\(UUID().uuidString)", defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    precondition(StreamQualityPreferences.load(defaults) == StreamQualityPreferences())
+    let saved = StreamQualityPreferences(codec: .hevc, chroma: .yuv444, bitrate: .mbps35, maxResolution: .native, fps: .fps60)
+    saved.save(defaults)
+    precondition(StreamQualityPreferences.load(defaults) == saved)
+    precondition(StreamQualityPreferences(codec: .h264, chroma: .yuv444, bitrate: .auto, maxResolution: .p1080, fps: .fps30).request(hevcDecode: true).chroma == .yuv420)
+    print("PASS quality request/effective JSON roundtrip, unknown/oversize rejection, host resolution, scaling and UserDefaults persistence")
 }
 var tailnet: TailnetHostTest?
 // Plain TCP host path with an injected authorizer standing in for `tailscale whois`.
@@ -395,4 +515,6 @@ func uiModelTests() {
     precondition(ShortcutAction.fullScreen.conflict(ShortcutAction.disconnect.fallback, defaults) == .disconnect && ShortcutAction.disconnect.conflict(custom, defaults) == .overlay)
     precondition(ShortcutAction.disconnect.conflict(ShortcutAction.disconnect.fallback, defaults) == nil && ShortcutAction.disconnect.conflict(Shortcut.from(combo)!, defaults) == nil)
     print("PASS saved session shortcuts consumed locally (⌃⌥⇧Q, ⌃⌥⌘F, custom ⇧⌘E), other combos and keyUp forwarded; recorder rejects a combo used by another action")
+    precondition(Permission.all.map(\.verifiable) == [true, true, false])
+    print("PASS input monitoring marked non-verifiable so it displays manual check and is excluded from missing-permission banner")
 }

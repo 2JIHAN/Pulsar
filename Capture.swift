@@ -4,31 +4,68 @@ import VideoToolbox
 import ApplicationServices
 
 final class VideoEncoder {
-    private let session: VTCompressionSession
-    private let onOutput: (Data?) -> Void
-    // onOutput runs on a VideoToolbox thread with a wire message, or nil when the frame was dropped.
-    init(width: Int, height: Int, onOutput: @escaping (Data?) -> Void) throws {
+    static let supportsHardwareHEVC: Bool = {
         var created: VTCompressionSession?
         let spec = [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true] as CFDictionary
-        guard VTCompressionSessionCreate(allocator: nil, width: Int32(width), height: Int32(height), codecType: kCMVideoCodecType_H264, encoderSpecification: spec, imageBufferAttributes: nil, compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &created) == noErr, let session = created else { throw WireError.invalid }
-        self.session = session; self.onOutput = onOutput
+        guard VTCompressionSessionCreate(allocator: nil, width: 1280, height: 720, codecType: kCMVideoCodecType_HEVC, encoderSpecification: spec, imageBufferAttributes: nil, compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &created) == noErr, let s = created else { return false }
+        defer { VTCompressionSessionInvalidate(s) }
+        return VTSessionSetProperty(s, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_HEVC_Main_AutoLevel) == noErr
+    }()
+
+    private let session: VTCompressionSession
+    let effectiveQuality: EffectiveQuality
+    private let onOutput: (Data?) -> Void
+
+    private static func makeSession(width: Int, height: Int, quality: EffectiveQuality) -> VTCompressionSession? {
+        var created: VTCompressionSession?
+        let spec = [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true] as CFDictionary
+        let codec: CMVideoCodecType = quality.codec == .hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264
+        let imageAttrs: CFDictionary? = (quality.codec == .hevc && quality.chroma == .yuv444)
+            ? [kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange] as CFDictionary
+            : nil
+        guard VTCompressionSessionCreate(allocator: nil, width: Int32(width), height: Int32(height), codecType: codec, encoderSpecification: spec, imageBufferAttributes: imageAttrs, compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &created) == noErr, let session = created else { return nil }
+        let profile: CFString = quality.codec == .h264
+            ? kVTProfileLevel_H264_High_AutoLevel
+            : (quality.chroma == .yuv444 ? ("HEVC_Main444_AutoLevel" as CFString) : kVTProfileLevel_HEVC_Main_AutoLevel)
+        let avgBitrate = quality.bitrateMbps * 1_000_000
+        let peakBytesPerSecond = quality.bitrateMbps * 187_500 // 1.5x average in bytes/sec
+        let fps = quality.fps.rawValue
         let properties: [CFString: Any] = [
             kVTCompressionPropertyKey_RealTime: true,
             kVTCompressionPropertyKey_AllowFrameReordering: false,
-            kVTCompressionPropertyKey_ProfileLevel: kVTProfileLevel_H264_High_AutoLevel,
-            kVTCompressionPropertyKey_AverageBitRate: 6_000_000,
-            kVTCompressionPropertyKey_DataRateLimits: [1_125_000, 1], // bytes per second: 9 Mbps peak
-            kVTCompressionPropertyKey_ExpectedFrameRate: 30,
-            kVTCompressionPropertyKey_MaxKeyFrameInterval: 60,
+            kVTCompressionPropertyKey_ProfileLevel: profile,
+            kVTCompressionPropertyKey_AverageBitRate: avgBitrate,
+            kVTCompressionPropertyKey_DataRateLimits: [peakBytesPerSecond, 1],
+            kVTCompressionPropertyKey_ExpectedFrameRate: fps,
+            kVTCompressionPropertyKey_MaxKeyFrameInterval: fps * 2,
             kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 2,
         ]
-        guard VTSessionSetProperties(session, propertyDictionary: properties as CFDictionary) == noErr, VTCompressionSessionPrepareToEncodeFrames(session) == noErr else { VTCompressionSessionInvalidate(session); throw WireError.invalid }
+        guard VTSessionSetProperties(session, propertyDictionary: properties as CFDictionary) == noErr, VTCompressionSessionPrepareToEncodeFrames(session) == noErr else {
+            VTCompressionSessionInvalidate(session)
+            return nil
+        }
+        return session
+    }
+
+    // onOutput runs on a VideoToolbox thread with a wire message, or nil when the frame was dropped.
+    init(width: Int, height: Int, quality: EffectiveQuality = .legacyDefaults, onOutput: @escaping (Data?) -> Void) throws {
+        var resolved = quality
+        var created = Self.makeSession(width: width, height: height, quality: resolved)
+        if created == nil, resolved.codec == .hevc && resolved.chroma == .yuv444 {
+            resolved.chroma = .yuv420
+            created = Self.makeSession(width: width, height: height, quality: resolved)
+        }
+        guard let session = created else { throw WireError.invalid }
+        self.session = session
+        self.effectiveQuality = resolved
+        self.onOutput = onOutput
     }
     deinit { VTCompressionSessionInvalidate(session) }
     func encode(_ pixel: CVImageBuffer, time: CMTime, keyframe: Bool) -> Bool {
         let options = keyframe ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
+        let codec = effectiveQuality.codec
         return VTCompressionSessionEncodeFrame(session, imageBuffer: pixel, presentationTimeStamp: time, duration: .invalid, frameProperties: options, infoFlagsOut: nil) { [onOutput] status, _, sample in
-            onOutput(status == noErr ? sample.flatMap(videoMessage) : nil)
+            onOutput(status == noErr ? sample.flatMap { videoMessage($0, codec: codec) } : nil)
         } == noErr
     }
 }
@@ -46,7 +83,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     // because dropping an encoded frame would break the decoder's reference chain.
     private var inFlight = 0
     private var needsKeyframe = true
-    @MainActor func start() async throws {
+    @MainActor func start(request: QualityRequest? = nil) async throws -> EffectiveQuality {
         guard !stopped else { throw WireError.invalid }
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard !stopped else { throw WireError.invalid }
@@ -54,22 +91,39 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         rect = CGDisplayBounds(display.displayID)
         let mode = CGDisplayCopyDisplayMode(display.displayID)
         let width = Double(mode?.pixelWidth ?? display.width), height = Double(mode?.pixelHeight ?? display.height)
-        let config = SCStreamConfiguration()
-        let scale = min(1, min(1920 / width, 1200 / height))
-        config.width = max(2, Int(width * scale) / 2 * 2)
-        config.height = max(2, Int(height * scale) / 2 * 2)
-        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 30)
-        config.queueDepth = 3; config.showsCursor = true; config.capturesAudio = false
-        let encoder = try VideoEncoder(width: config.width, height: config.height) { [weak self] message in self?.deliver(message) }
-        queue.sync { self.encoder = encoder }
-        let s = SCStream(filter: SCContentFilter(display: display, excludingWindows: []), configuration: config, delegate: self)
-        try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
-        stream = s; active = true
+        let targetQuality = request.map { EffectiveQuality.resolve($0, hostHEVCEncode: VideoEncoder.supportsHardwareHEVC) } ?? .legacyDefaults
+        let bounds = request == nil ? (1920.0, 1200.0) : targetQuality.maxResolution.maxBounds
+        let scaled = MaxResolutionOption.scaledSize(displayWidth: width, displayHeight: height, bounds: bounds)
+
+        func startWith(_ quality: EffectiveQuality) async throws -> EffectiveQuality {
+            let encoder = try VideoEncoder(width: scaled.width, height: scaled.height, quality: quality) { [weak self] message in self?.deliver(message) }
+            let actual = encoder.effectiveQuality
+            let config = SCStreamConfiguration()
+            config.width = scaled.width
+            config.height = scaled.height
+            config.pixelFormat = actual.chroma == .yuv444 ? kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(actual.fps.rawValue))
+            config.queueDepth = 3; config.showsCursor = true; config.capturesAudio = false
+            queue.sync { self.encoder = encoder; self.needsKeyframe = true; self.inFlight = 0 }
+            let s = SCStream(filter: SCContentFilter(display: display, excludingWindows: []), configuration: config, delegate: self)
+            try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+            stream = s; active = true
+            do {
+                try await s.startCapture()
+                if stopped { try? await s.stopCapture(); throw WireError.invalid }
+                return actual
+            } catch {
+                active = false; stream = nil
+                throw error
+            }
+        }
+
         do {
-            try await s.startCapture()
-            if stopped { try? await s.stopCapture(); throw WireError.invalid }
-        } catch { active = false; stream = nil; throw error }
+            return try await startWith(targetQuality)
+        } catch where targetQuality.chroma == .yuv444 && !stopped {
+            var fallback = targetQuality; fallback.chroma = .yuv420
+            return try await startWith(fallback)
+        }
     }
     func stop() {
         dispatchPrecondition(condition: .onQueue(.main))

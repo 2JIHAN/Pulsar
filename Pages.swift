@@ -1,6 +1,7 @@
 import AppKit
 import Network
 import ServiceManagement
+import VideoToolbox
 
 // Swiss railway signage: flat colour, hairline rules, colour only for state.
 // Red is reserved for live state and disconnect; navy only for the primary connect action.
@@ -417,7 +418,7 @@ final class ComputersPage: NSView, NSTableViewDataSource, NSTableViewDelegate {
         } else { emptyTitle.stringValue = "Tailscale 네트워크에 기기가 없습니다"; emptyBody.stringValue = "다른 Mac에서 같은 계정으로 Tailscale에 로그인하면 여기에 나타납니다." }
         table.reloadData()
     }
-    func refreshPermissions() { permLine.isHidden = Permission.all.allSatisfy { $0.granted() } }
+    func refreshPermissions() { permLine.isHidden = Permission.all.filter(\.verifiable).allSatisfy { $0.granted() } }
     @objc func codePage() { onCodePage?() }
     @objc func settings() { onSettings?() }
     @objc func connect(_ sender: NSButton) { if devices.indices.contains(sender.tag) { onConnect?(devices[sender.tag]) } }
@@ -463,10 +464,19 @@ final class ComputersPage: NSView, NSTableViewDataSource, NSTableViewDelegate {
 
 extension Permission {
     func show(icon: NSImageView, text: NSTextField) {
+        guard verifiable else {
+            icon.image = nil
+            icon.isHidden = true
+            text.stringValue = "직접 확인 필요"
+            text.textColor = Palette.secondary
+            return
+        }
+        icon.isHidden = false
         let ok = granted()
         icon.image = symbol(ok ? "checkmark.circle.fill" : "xmark.circle.fill")
         icon.contentTintColor = ok ? Palette.green : Palette.red
         text.stringValue = ok ? "허용됨" : "허용 안 됨"
+        text.textColor = Palette.secondary
     }
 }
 
@@ -516,6 +526,15 @@ final class SettingsPage: NSObject {
     let loginItem = NSSwitch()
     let loginNote = label("", 11, .regular, Palette.secondary)
     let keyNote = label("", 11, .regular, Palette.secondary)
+    let codecPopup = NSPopUpButton()
+    let chromaControl = NSSegmentedControl(labels: ["표준 (4:2:0)", "선명한 글자 (4:4:4)"], trackingMode: .selectOne, target: nil, action: nil)
+    let bitratePopup = NSPopUpButton()
+    let resolutionPopup = NSPopUpButton()
+    let fpsControl = NSSegmentedControl(labels: ["30 fps", "60 fps"], trackingMode: .selectOne, target: nil, action: nil)
+    let qualityNote = label("최근 연결: 없음", 11, .regular, Palette.secondary)
+    private var lastEffective: String?
+    private var isConnected = false
+    private var changedWhileConnected = false
     var onSystemChanged: (() -> Void)?
     static let autoShareKey = "autoShare"
     static func autoShares(_ d: UserDefaults = .standard) -> Bool { d.object(forKey: autoShareKey) as? Bool ?? true }
@@ -550,7 +569,20 @@ final class SettingsPage: NSObject {
         system.state = ShortcutAction.sendsSystem() ? .on : .off
         system.target = self; system.action = #selector(systemChanged)
         keyRows.append(settingRow("시스템 단축키를 원격으로 보내기", "⌘Tab, ⌘Space, ⌃화살표를 상대 Mac으로 보냅니다. 기기 제어 및 데이터 접근 권한이 필요합니다. 끄면 이 Mac에서 실행됩니다.", [system]))
-        let readout = { (text: String) -> NSTextField in let l = label(text, 13, .regular, Palette.secondary); l.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular); return l }
+        codecPopup.addItems(withTitles: ["자동", "H.264", "HEVC (H.265)"])
+        bitratePopup.addItems(withTitles: ["자동 (8 Mbps)", "5 Mbps", "10 Mbps", "20 Mbps", "35 Mbps", "50 Mbps"])
+        resolutionPopup.addItems(withTitles: ["1080p (1920×1080)", "1440p (2560×1440)", "원본 (최대 3840×2400)"])
+        for c in [codecPopup, bitratePopup, resolutionPopup] as [NSControl] { c.target = self; c.action = #selector(qualityChanged) }
+        for c in [chromaControl, fpsControl] as [NSSegmentedControl] { c.target = self; c.action = #selector(qualityChanged) }
+        syncQualityControls()
+        qualityNote.lineBreakMode = .byWordWrapping; qualityNote.maximumNumberOfLines = 0
+        let qualityRows = [
+            settingRow("코덱", "자동은 양쪽 Mac이 하드웨어 HEVC를 지원할 때 HEVC를 사용합니다.", [codecPopup]),
+            settingRow("색상", "선명한 글자(4:4:4)는 HEVC에서만 활성화되며, 미지원 시 4:2:0으로 적용됩니다.", [chromaControl]),
+            settingRow("비트레이트", "최대 대역폭은 평균의 1.5배로 제한합니다.", [bitratePopup]),
+            settingRow("최대 해상도", "호스트 기본 해상도를 짝수 크기와 비율을 유지해 축소합니다.", [resolutionPopup]),
+            settingRow("프레임", "60 fps는 화면이 부드럽지만 더 많은 대역폭을 사용합니다.", [fpsControl]),
+        ]
         let info = Bundle.main.infoDictionary
         let version = label("Pulsar \(info?["CFBundleShortVersionString"] as? String ?? "") (\(info?["CFBundleVersion"] as? String ?? ""))", 11, .regular, Palette.secondary)
         view = scrollPage([
@@ -558,13 +590,50 @@ final class SettingsPage: NSObject {
             sectionTitle("일반"), group(general), gap(20),
             sectionTitle("권한"), group(permRows), note, gap(20),
             sectionTitle("단축키"), group(keyRows), keyNote, gap(20),
-            sectionTitle("화면"), group([settingRow("해상도", nil, [readout("최대 1920×1200")]), settingRow("프레임", nil, [readout("최대 30fps")])]),
+            sectionTitle("화면 품질"), group(qualityRows), qualityNote,
             gap(12), version,
         ])
         refreshPermissions()
     }
     func refreshPermissions() { for (i, p) in Permission.all.enumerated() { p.show(icon: permIcons[i], text: permLabels[i]) } }
     func stopRecording() { recorders.forEach { $0.stop() } }
+    func setLastEffective(_ summary: String) { lastEffective = summary; updateQualityNote() }
+    func setConnected(_ connected: Bool) {
+        isConnected = connected
+        if !connected { changedWhileConnected = false }
+        updateQualityNote()
+    }
+    private func updateQualityNote() {
+        let base = "최근 연결: \(lastEffective ?? "없음")"
+        qualityNote.stringValue = (isConnected && changedWhileConnected) ? "\(base)  ·  적용하려면 다시 연결" : base
+    }
+    private func syncQualityControls() {
+        let prefs = StreamQualityPreferences.load()
+        codecPopup.selectItem(at: CodecPreference.allCases.firstIndex(of: prefs.codec) ?? 0)
+        bitratePopup.selectItem(at: BitrateOption.allCases.firstIndex(of: prefs.bitrate) ?? 0)
+        resolutionPopup.selectItem(at: MaxResolutionOption.allCases.firstIndex(of: prefs.maxResolution) ?? 0)
+        fpsControl.selectedSegment = FPSOption.allCases.firstIndex(of: prefs.fps) ?? 0
+        updateChromaState(savedChroma: prefs.chroma)
+    }
+    private func updateChromaState(savedChroma: ChromaOption) {
+        let codec = CodecPreference.allCases[max(0, codecPopup.indexOfSelectedItem)]
+        let hevcPossible = codec == .hevc || (codec == .auto && VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC))
+        chromaControl.setEnabled(hevcPossible, forSegment: 1)
+        chromaControl.selectedSegment = hevcPossible && savedChroma == .yuv444 ? 1 : 0
+    }
+    @objc func qualityChanged(_ sender: NSControl) {
+        var prefs = StreamQualityPreferences.load()
+        prefs.codec = CodecPreference.allCases[max(0, codecPopup.indexOfSelectedItem)]
+        prefs.bitrate = BitrateOption.allCases[max(0, bitratePopup.indexOfSelectedItem)]
+        prefs.maxResolution = MaxResolutionOption.allCases[max(0, resolutionPopup.indexOfSelectedItem)]
+        prefs.fps = FPSOption.allCases[max(0, fpsControl.selectedSegment)]
+        if sender === chromaControl {
+            prefs.chroma = chromaControl.selectedSegment == 1 ? .yuv444 : .yuv420
+        }
+        prefs.save()
+        updateChromaState(savedChroma: prefs.chroma)
+        if isConnected { changedWhileConnected = true; updateQualityNote() }
+    }
     @objc func open(_ sender: NSButton) { Permission.all[sender.tag].openSettings() }
     @objc func systemChanged() { UserDefaults.standard.set(system.state == .on, forKey: ShortcutAction.systemKey); onSystemChanged?() }
     @objc func autoShareChanged() { UserDefaults.standard.set(autoShare.state == .on, forKey: Self.autoShareKey) }
@@ -589,6 +658,7 @@ final class SessionView: NSView {
     let board = FillView(Palette.board)
     let dot = Dot()
     let peer = label("", 13, .semibold, .white)
+    let quality = label("", 12, .regular, NSColor(white: 1, alpha: 0.72))
     let metrics = label("", 13, .regular, NSColor(white: 1, alpha: 0.72))
     let fullScreen = NSButton(title: "전체 화면", target: nil, action: nil)
     let leave = NSButton(title: "연결 종료", target: nil, action: nil)
@@ -600,10 +670,12 @@ final class SessionView: NSView {
     init(viewer: Viewer) {
         self.viewer = viewer
         super.init(frame: .zero)
+        quality.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        quality.setContentCompressionResistancePriority(.init(749), for: .horizontal)
         metrics.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
         leave.bezelColor = Palette.red
         board.appearance = NSAppearance(named: .darkAqua)
-        let row = hstack([dot, peer, metrics, spacer(), fullScreen, leave], 10)
+        let row = hstack([dot, peer, quality, metrics, spacer(), fullScreen, leave], 10)
         row.setCustomSpacing(16, after: metrics)
         for v in [viewer, board] as [NSView] { v.translatesAutoresizingMaskIntoConstraints = false; addSubview(v) }
         row.translatesAutoresizingMaskIntoConstraints = false; board.addSubview(row)
@@ -647,6 +719,7 @@ final class SessionView: NSView {
             board.animator().alphaValue = show ? 1 : 0
         }, completionHandler: { [weak self] in guard let self, !self.shown else { return }; self.board.isHidden = true })
     }
+    func setQuality(_ text: String) { quality.stringValue = text }
     func live(peer name: String, metrics text: String) {
         if reconnectShown { reconnectShown = false; flash(3) }
         dot.color = Palette.red; dot.pulse(true)
