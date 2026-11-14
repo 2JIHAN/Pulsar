@@ -146,7 +146,7 @@ func gap(_ height: CGFloat) -> NSView { let v = NSView(); v.heightAnchor.constra
 
 struct TailscaleDevice: Equatable {
     enum State: Equatable { case thisMac, online, otherAccount, offline, unsupported }
-    let name: String, os: String, online: Bool, ips: [String], isSelf: Bool, direct: Bool, sameAccount: Bool
+    let name: String, os: String, online: Bool, ips: [String], isSelf: Bool, direct: Bool, relayed: Bool, sameAccount: Bool
     var state: State { isSelf ? .thisMac : os != "macOS" ? .unsupported : !online ? .offline : sameAccount ? .online : .otherAccount }
     var stateText: String {
         switch state {
@@ -155,10 +155,9 @@ struct TailscaleDevice: Equatable {
         }
     }
     var ipv4: String? { ips.first { !$0.contains(":") } }
-    // CurAddr is only set while a direct UDP path exists; otherwise traffic may go through DERP or be idle.
-    var path: String { isSelf || !online ? "—" : direct ? "Tailscale 직접" : "Tailscale" }
+    var path: String { isSelf || !online ? "—" : direct ? "Tailscale 직접" : relayed ? "Tailscale 중계" : "Tailscale" }
 
-    private struct Node: Decodable { var HostName: String?; var OS: String?; var Online: Bool?; var TailscaleIPs: [String]?; var CurAddr: String?; var UserID: Int64? }
+    private struct Node: Decodable { var HostName: String?; var OS: String?; var Online: Bool?; var TailscaleIPs: [String]?; var CurAddr: String?; var Relay: String?; var UserID: Int64? }
     private struct User: Decodable { var LoginName: String? }
     private struct Status: Decodable {
         var BackendState: String?; var me: Node?; var Peer: [String: Node]?; var User: [String: User]?
@@ -171,7 +170,8 @@ struct TailscaleDevice: Equatable {
         let owner = s.me?.UserID
         func device(_ n: Node, isSelf: Bool) -> TailscaleDevice {
             TailscaleDevice(name: (n.HostName ?? "이름 없음").replacingOccurrences(of: "\u{00A0}", with: " "), os: n.OS ?? "",
-                            online: isSelf || (n.Online ?? false), ips: n.TailscaleIPs ?? [], isSelf: isSelf, direct: !(n.CurAddr ?? "").isEmpty,
+                            online: isSelf || (n.Online ?? false), ips: n.TailscaleIPs ?? [], isSelf: isSelf,
+                            direct: !(n.CurAddr ?? "").isEmpty, relayed: !(n.Relay ?? "").isEmpty,
                             sameAccount: owner != nil && n.UserID == owner)
         }
         let order: [State] = [.thisMac, .online, .otherAccount, .offline, .unsupported]
@@ -183,8 +183,7 @@ struct TailscaleDevice: Equatable {
         return Tailnet(devices: devices, login: owner.flatMap { s.User?[String($0)]?.LoginName })
     }
     static let cli = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
-    // Blocking; call off the main thread. Returns stdout even on a non-zero exit, since
-    // `ping` exits 1 for a DERP-relayed pong.
+    // Blocking; call off the main thread.
     static func run(_ args: [String], timeout: TimeInterval) -> (out: Data, ok: Bool)? {
         let p = Process(), out = Pipe()
         p.executableURL = URL(fileURLWithPath: cli); p.arguments = args
@@ -204,23 +203,10 @@ struct TailscaleDevice: Equatable {
     }
 }
 
-// What a 10 s probe learned about a peer: `tailscale ping` for latency and route, a TCP connect to 47700 for sharing.
+// What a 10 s probe learned about a peer: a TCP connect to 47700 for sharing.
 struct Probe: Equatable {
-    var latency: String?
-    var route: String?
     var sharing: Bool
-    // "pong from macbookpro (100.76.63.21) via 192.168.45.194:41641 in 10ms" or "... via DERP(tok) in 277ms".
-    static func parsePing(_ text: String) -> (latency: String, route: String)? {
-        guard let line = text.split(separator: "\n").first(where: { $0.hasPrefix("pong from ") }),
-              let via = line.range(of: " via "), let inRange = line.range(of: " in ", range: via.upperBound..<line.endIndex),
-              line.hasSuffix("ms"), let ms = Double(line[inRange.upperBound..<line.index(line.endIndex, offsetBy: -2)]) else { return nil }
-        let route = line[via.upperBound..<inRange.lowerBound]
-        return ("\(Int(ms.rounded())) ms", route.hasPrefix("DERP(") ? "Tailscale 중계" : "Tailscale 직접")
-    }
-    static func run(_ ip: String) -> Probe {
-        let ping = TailscaleDevice.run(["ping", "--c", "1", "--timeout", "2s", ip], timeout: 4).flatMap { parsePing(String(decoding: $0.out, as: UTF8.self)) }
-        return Probe(latency: ping?.latency, route: ping?.route, sharing: portOpen(ip, tailnetPort, timeout: 1.5))
-    }
+    static func run(_ ip: String) -> Probe { Probe(sharing: portOpen(ip, tailnetPort, timeout: 1.5)) }
     // Closes right after the TCP handshake; the host drops such a connection because no hello follows.
     static func portOpen(_ ip: String, _ port: UInt16, timeout: TimeInterval) -> Bool {
         let c = NWConnection(host: NWEndpoint.Host(ip), port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
@@ -267,17 +253,20 @@ struct Shortcut: Codable, Equatable {
 enum ShortcutAction: String, CaseIterable {
     case disconnect, overlay, fullScreen
     var title: String { switch self { case .disconnect: return "연결 종료"; case .overlay: return "오버레이 메뉴"; case .fullScreen: return "전체 화면" } }
+    private static let legacyDisconnect = Shortcut(keyCode: 2, modifiers: NSEvent.ModifierFlags([.control, .option, .command]).rawValue, key: "D")
     var fallback: Shortcut {
         let m = NSEvent.ModifierFlags([.control, .option, .command]).rawValue
         switch self {
-        case .disconnect: return Shortcut(keyCode: 2, modifiers: m, key: "D")
+        case .disconnect: return Shortcut(keyCode: 12, modifiers: NSEvent.ModifierFlags([.control, .option, .shift]).rawValue, key: "Q")
         case .overlay: return Shortcut(keyCode: 31, modifiers: m, key: "O")
         case .fullScreen: return Shortcut(keyCode: 3, modifiers: m, key: "F")
         }
     }
     var defaultsKey: String { "shortcut." + rawValue }
     func load(_ d: UserDefaults = .standard) -> Shortcut {
-        d.data(forKey: defaultsKey).flatMap { try? JSONDecoder().decode(Shortcut.self, from: $0) } ?? fallback
+        guard let saved = d.data(forKey: defaultsKey).flatMap({ try? JSONDecoder().decode(Shortcut.self, from: $0) }) else { return fallback }
+        if self == .disconnect && saved.same(Self.legacyDisconnect) { save(fallback, d); return fallback }
+        return saved
     }
     func save(_ s: Shortcut, _ d: UserDefaults = .standard) { d.set(try? JSONEncoder().encode(s), forKey: defaultsKey) }
     // Checked before a key goes to the remote Mac; a match stays local.
@@ -306,19 +295,15 @@ final class SidebarRow: NSTableRowView {
 final class SidebarController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
     let items = [("컴퓨터", "desktopcomputer"), ("연결코드", "chevron.left.forwardslash.chevron.right"), ("설정", "gearshape")]
     let table = NSTableView()
-    let hostDot = Dot()
-    let hostLabel = label("공유 꺼짐", 12, .regular, Palette.secondary)
-    let hostButton: NSButton
     var onSelect: ((Int) -> Void)?
-    init(hostButton: NSButton) { self.hostButton = hostButton; super.init(nibName: nil, bundle: nil) }
-    required init?(coder: NSCoder) { nil }
     override func loadView() {
         let root = FillView(Palette.sidebar)
         table.style = .sourceList; table.selectionHighlightStyle = .regular; table.headerView = nil; table.rowHeight = 32; table.backgroundColor = .clear
         table.addTableColumn(NSTableColumn(identifier: .init("item")))
         table.dataSource = self; table.delegate = self
         let scroll = NSScrollView(); scroll.documentView = table; scroll.drawsBackground = false
-        let bottom = vstack([hstack([hostDot, hostLabel], 8), hostButton], 10); bottom.alignment = .leading
+        let shortVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+        let bottom = label(shortVersion.isEmpty ? "Pulsar" : "Pulsar \(shortVersion)", 11, .regular, Palette.secondary)
         for v in [scroll, bottom] as [NSView] { v.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(v) }
         NSLayoutConstraint.activate([
             scroll.topAnchor.constraint(equalTo: root.safeAreaLayoutGuide.topAnchor, constant: 8),
@@ -343,10 +328,6 @@ final class SidebarController: NSViewController, NSTableViewDataSource, NSTableV
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { SidebarRow() }
     func tableViewSelectionDidChange(_ notification: Notification) { if table.selectedRow >= 0 { onSelect?(table.selectedRow) } }
     func select(_ page: Int) { if table.selectedRow != page { table.selectRowIndexes([page], byExtendingSelection: false) } }
-    func setHosting(_ on: Bool) {
-        hostDot.color = on ? Palette.red : Palette.dim
-        hostLabel.stringValue = on ? "이 Mac 공유 중" : "공유 꺼짐"; hostLabel.textColor = on ? Palette.ink : Palette.secondary
-    }
 }
 
 // MARK: 컴퓨터 page
@@ -369,8 +350,7 @@ final class ComputersPage: NSView, NSTableViewDataSource, NSTableViewDelegate {
     let emptyTitle = label("Tailscale 기기를 확인하는 중…", 15, .semibold)
     let emptyBody = NSTextField(wrappingLabelWithString: "")
     let emptyButton = NSButton(title: "연결코드로 접속", target: nil, action: nil)
-    let permIcons = Permission.all.map { _ in NSImageView() }
-    let permLabels = Permission.all.map { _ in label("", 12) }
+    let permLine: NSStackView
     let note = label("", 12, .regular, Palette.secondary)
     var devices = [TailscaleDevice]()
     var probes = [String: Probe]() { didSet { if probes != oldValue { table.reloadData() } } }
@@ -379,11 +359,20 @@ final class ComputersPage: NSView, NSTableViewDataSource, NSTableViewDelegate {
     var onCodePage: (() -> Void)?
     var onSettings: (() -> Void)?
 
-    init(allow: NSSwitch) {
+    init() {
+        let permButton = NSButton(title: "설정 열기", target: nil, action: nil)
+        permButton.isBordered = false
+        permButton.attributedTitle = NSAttributedString(string: "설정 열기", attributes: [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: Palette.ink,
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+        ])
+        permLine = hstack([label("필요한 권한이 허용되지 않았습니다.", 12, .regular, Palette.secondary), permButton], 8)
         super.init(frame: .zero)
+        permButton.target = self; permButton.action = #selector(settings)
         let codeButton = NSButton(title: "연결코드로 접속", target: self, action: #selector(codePage))
         let head = hstack([heading("컴퓨터"), spacer(), codeButton], 12)
-        let columns: [(String, String, CGFloat)] = [("device", "기기", 260), ("path", "경로", 150), ("latency", "지연", 80), ("state", "상태", 130), ("action", "", 96)]
+        let columns: [(String, String, CGFloat)] = [("device", "기기", 260), ("path", "경로", 150), ("state", "상태", 130), ("action", "", 96)]
         for (id, title, width) in columns {
             let c = NSTableColumn(identifier: .init(id)); c.headerCell = BoardHeaderCell(textCell: title); c.width = width; c.minWidth = id == "action" ? 96 : 60
             c.resizingMask = id == "device" ? [.autoresizingMask] : []
@@ -399,32 +388,22 @@ final class ComputersPage: NSView, NSTableViewDataSource, NSTableViewDelegate {
         let empty = vstack([emptyTitle, emptyBody, gap(4), emptyButton], 8)
         emptyButton.isHidden = true
 
-        let allowRow = hstack([allow, label("원격 입력 허용")], 8)
-        var strip: [NSView] = [label("이 Mac", 15, .bold), allowRow, separator()]
-        for (icon, text) in zip(permIcons, permLabels) { text.setContentCompressionResistancePriority(.init(749), for: .horizontal); strip.append(hstack([icon, text], 4)) }
-        strip += [spacer(), NSButton(title: "설정 열기", target: self, action: #selector(settings))]
-        let bottom = hstack(strip, 16)
-        let line = rule()
-        for v in [head, note, scroll, empty, line, bottom] as [NSView] { v.translatesAutoresizingMaskIntoConstraints = false; addSubview(v) }
+        let subhead = vstack([permLine, note], 4)
+        for v in [head, subhead, scroll, empty] as [NSView] { v.translatesAutoresizingMaskIntoConstraints = false; addSubview(v) }
         NSLayoutConstraint.activate([
             head.topAnchor.constraint(equalTo: safeAreaLayoutGuide.topAnchor, constant: 16),
             head.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 40), head.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -40),
-            note.topAnchor.constraint(equalTo: head.bottomAnchor, constant: 6),
-            note.leadingAnchor.constraint(equalTo: head.leadingAnchor), note.trailingAnchor.constraint(lessThanOrEqualTo: head.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: note.bottomAnchor, constant: 16),
+            subhead.topAnchor.constraint(equalTo: head.bottomAnchor, constant: 6),
+            subhead.leadingAnchor.constraint(equalTo: head.leadingAnchor), subhead.trailingAnchor.constraint(lessThanOrEqualTo: head.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: subhead.bottomAnchor, constant: 16),
             scroll.leadingAnchor.constraint(equalTo: head.leadingAnchor), scroll.trailingAnchor.constraint(equalTo: head.trailingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: line.topAnchor, constant: -12),
+            scroll.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -16),
             empty.leadingAnchor.constraint(equalTo: head.leadingAnchor), empty.topAnchor.constraint(equalTo: scroll.topAnchor, constant: 56),
-            line.leadingAnchor.constraint(equalTo: head.leadingAnchor), line.trailingAnchor.constraint(equalTo: head.trailingAnchor),
-            line.bottomAnchor.constraint(equalTo: bottom.topAnchor),
-            bottom.leadingAnchor.constraint(equalTo: head.leadingAnchor), bottom.trailingAnchor.constraint(equalTo: head.trailingAnchor),
-            bottom.heightAnchor.constraint(equalToConstant: 60), bottom.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
         update(devices: nil, loading: true)
         refreshPermissions()
     }
     required init?(coder: NSCoder) { nil }
-    func separator() -> NSView { let v = FillView(Palette.rule); v.widthAnchor.constraint(equalToConstant: 1).isActive = true; v.heightAnchor.constraint(equalToConstant: 20).isActive = true; return v }
 
     func update(devices found: [TailscaleDevice]?, loading: Bool = false) {
         devices = found ?? []
@@ -438,9 +417,7 @@ final class ComputersPage: NSView, NSTableViewDataSource, NSTableViewDelegate {
         } else { emptyTitle.stringValue = "Tailscale 네트워크에 기기가 없습니다"; emptyBody.stringValue = "다른 Mac에서 같은 계정으로 Tailscale에 로그인하면 여기에 나타납니다." }
         table.reloadData()
     }
-    func refreshPermissions() {
-        for (i, p) in Permission.all.enumerated() { p.show(icon: permIcons[i], text: permLabels[i], prefix: p.title + " ") }
-    }
+    func refreshPermissions() { permLine.isHidden = Permission.all.allSatisfy { $0.granted() } }
     @objc func codePage() { onCodePage?() }
     @objc func settings() { onSettings?() }
     @objc func connect(_ sender: NSButton) { if devices.indices.contains(sender.tag) { onConnect?(devices[sender.tag]) } }
@@ -454,9 +431,7 @@ final class ComputersPage: NSView, NSTableViewDataSource, NSTableViewDelegate {
         var views: [NSView]
         switch tableColumn?.identifier.rawValue {
         case "device": views = [label(d.name, 15, .semibold, color)]
-        case "path": views = [label(probe?.route ?? d.path, 13, .regular, color)]
-        case "latency":
-            let l = label(probe?.latency ?? "—", 13, .regular, color); l.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular); views = [l]
+        case "path": views = [label(d.path, 13, .regular, color)]
         case "state":
             let dot = Dot()
             switch d.state {
@@ -487,11 +462,11 @@ final class ComputersPage: NSView, NSTableViewDataSource, NSTableViewDelegate {
 }
 
 extension Permission {
-    func show(icon: NSImageView, text: NSTextField, prefix: String) {
+    func show(icon: NSImageView, text: NSTextField) {
         let ok = granted()
         icon.image = symbol(ok ? "checkmark.circle.fill" : "xmark.circle.fill")
         icon.contentTintColor = ok ? Palette.green : Palette.red
-        text.stringValue = prefix + (ok ? grantedText : "허용 안 됨")
+        text.stringValue = ok ? "허용됨" : "허용 안 됨"
     }
 }
 
@@ -544,7 +519,7 @@ final class SettingsPage: NSObject {
     var onSystemChanged: (() -> Void)?
     static let autoShareKey = "autoShare"
     static func autoShares(_ d: UserDefaults = .standard) -> Bool { d.object(forKey: autoShareKey) as? Bool ?? true }
-    override init() {
+    init(allow: NSSwitch) {
         super.init()
         autoShare.state = Self.autoShares() ? .on : .off
         autoShare.target = self; autoShare.action = #selector(autoShareChanged)
@@ -553,6 +528,7 @@ final class SettingsPage: NSObject {
         let general = [
             settingRow("Pulsar 실행 시 자동으로 공유 시작", "같은 Tailscale 계정의 Mac이 목록에서 바로 연결할 수 있습니다.", [autoShare]),
             settingRow("로그인 시 Pulsar 실행", nil, [loginNote, loginItem]),
+            settingRow("다른 Mac이 이 Mac을 조작하도록 허용", "끄면 화면만 보여 주고 마우스와 키보드 입력은 받지 않습니다.", [allow]),
         ]
         var permRows = [NSView]()
         for (i, p) in Permission.all.enumerated() {
@@ -587,7 +563,7 @@ final class SettingsPage: NSObject {
         ])
         refreshPermissions()
     }
-    func refreshPermissions() { for (i, p) in Permission.all.enumerated() { p.show(icon: permIcons[i], text: permLabels[i], prefix: "") } }
+    func refreshPermissions() { for (i, p) in Permission.all.enumerated() { p.show(icon: permIcons[i], text: permLabels[i]) } }
     func stopRecording() { recorders.forEach { $0.stop() } }
     @objc func open(_ sender: NSButton) { Permission.all[sender.tag].openSettings() }
     @objc func systemChanged() { UserDefaults.standard.set(system.state == .on, forKey: ShortcutAction.systemKey); onSystemChanged?() }

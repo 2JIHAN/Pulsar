@@ -137,7 +137,6 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let allow = NSSwitch()
     let viewer = Viewer()
     let hostButton = NSButton(title: "공유 시작", target: nil, action: nil)
-    let sidebarHostButton = NSButton(title: "공유 시작", target: nil, action: nil)
     var listener: NWListener?
     var secret: Data?
     var token: String?
@@ -222,6 +221,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         deviceTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in self?.refreshDevices() }
         refreshDevices()
         settings.onSystemChanged = { [weak self] in self?.updateHotKeys() }
+        if let listen = Permission.all.first(where: { $0.pane == "Privacy_ListenEvent" }), !listen.granted() { listen.request() }
         if UserDefaults.standard.bool(forKey: allowKey) && AXIsProcessTrusted() { allow.state = .on }
         if SettingsPage.autoShares() {
             if CGPreflightScreenCaptureAccess() { startHost() }
@@ -236,13 +236,12 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.title = "Pulsar"; window.titleVisibility = .hidden; window.titlebarAppearsTransparent = true; window.titlebarSeparatorStyle = .none
         window.delegate = self; window.minSize = NSSize(width: 960, height: 600)
         let found = localAddresses().sorted { rank($0) < rank($1) }; ips = found.map { $0.1 }; addresses.addItems(withTitles: found.map { $0.0 }); if ips.isEmpty { ips = ["127.0.0.1"]; addresses.addItem(withTitle: "로컬 테스트 127.0.0.1") }
-        for b in [hostButton, sidebarHostButton] { b.target = self }
-        hostButton.action = #selector(toggleHost); sidebarHostButton.action = #selector(sidebarToggleHost)
+        hostButton.target = self; hostButton.action = #selector(toggleHost)
         allow.target = self; allow.action = #selector(permission)
 
-        sidebar = SidebarController(hostButton: sidebarHostButton)
+        sidebar = SidebarController()
         sidebar.onSelect = { [weak self] page in self?.show(page) }
-        computers = ComputersPage(allow: allow)
+        computers = ComputersPage()
         computers.onCodePage = { [weak self] in self?.select(1) }
         computers.onSettings = { [weak self] in self?.select(2) }
         computers.onConnect = { [weak self] d in
@@ -250,7 +249,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.disconnectViewer(); self.returnPage = 0
             self.session.start(DialTarget(tailnet: ip)); self.statusText = "\(d.name)에 연결하는 중…"; self.dial()
         }
-        settings = SettingsPage()
+        settings = SettingsPage(allow: allow)
         sessionView = SessionView(viewer: viewer)
         sessionView.fullScreen.target = self; sessionView.fullScreen.action = #selector(toggleFullScreen)
         sessionView.leave.target = self; sessionView.leave.action = #selector(disconnectViewer)
@@ -307,14 +306,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case .fullScreen: toggleFullScreen()
         }
     }
-    @objc func sidebarToggleHost() {
-        let starting = !hosting
-        toggleHost()
-        if starting { select(1) }
-    }
     func refreshHostState() {
-        for b in [hostButton, sidebarHostButton] { b.title = hosting ? "공유 중지" : "공유 시작" }
-        sidebar.setHosting(hosting); computers.hosting = hosting
+        hostButton.title = hosting ? "공유 중지" : "공유 시작"
+        computers.hosting = hosting
     }
     func refreshDevices() {
         guard !fetching else { return }
@@ -335,8 +329,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func tick() {
         if inSession {
             guard outbound?.ready == true else { return }
-            let latency = session.target.flatMap { computers.probes[$0.host]?.latency } ?? "—"
-            sessionView.live(peer: peerName, metrics: String(format: "지연 %@  ·  %d fps  ·  %.1f Mbps", latency, frames, Double(bytes) * 8 / 1_000_000))
+            sessionView.live(peer: peerName, metrics: String(format: "%d fps  ·  %.1f Mbps", frames, Double(bytes) * 8 / 1_000_000))
             frames = 0; bytes = 0
         } else if window.isVisible {
             if content.current == 0 { computers.refreshPermissions() }
@@ -354,7 +347,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             split.splitViewItems[0].isCollapsed = true
             sessionView.isHidden = false
         }
-        sessionView.live(peer: peerName, metrics: "지연 —  ·  측정 중")
+        sessionView.live(peer: peerName, metrics: "측정 중")
         sessionView.flash(3)
     }
     func leaveSession() {
@@ -432,7 +425,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func startCapture(for p: Peer) {
         gestureNoted = false
-        statusText = (p.greet ? "Tailscale로 연결됨." : "암호화 연결됨.") + " 화면 전송 중. 원격 입력은 컴퓨터 화면의 원격 입력 허용으로 제어합니다."
+        statusText = (p.greet ? "Tailscale로 연결됨." : "암호화 연결됨.") + " 화면 전송 중. 원격 입력은 설정 > 일반에서 제어합니다."
         let capture = Capture(); self.capture = capture
         capture.onFrame = { [weak self, weak p, weak capture] data, sent in guard let self = self, let capture = capture, self.host.active === p, self.capture === capture else { return }; p?.frame(data, sent: sent) }
         capture.onError = { [weak self, weak p] message in guard let self = self, self.host.active === p else { return }; p?.close(); self.statusText = message }

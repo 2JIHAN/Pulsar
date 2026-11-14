@@ -346,22 +346,17 @@ func uiModelTests() {
      "User":{"7":{"LoginName":"me@example.com"},"9":{"LoginName":"guest@example.com"}},
      "Peer":{"a":{"HostName":"z-fold7","OS":"android","Online":true,"TailscaleIPs":["100.99.0.1"],"UserID":7},
              "b":{"HostName":"old\\u00a0mac","OS":"macOS","Online":false,"TailscaleIPs":["100.1.1.1"],"UserID":7},
-             "c":{"HostName":"macbookpro","OS":"macOS","Online":true,"TailscaleIPs":["fd7a::2","100.76.63.21"],"CurAddr":"192.168.0.5:41641","UserID":7},
-             "d":{"HostName":"air","OS":"macOS","Online":true,"TailscaleIPs":["100.2.2.2"],"CurAddr":"","UserID":7},
-             "e":{"HostName":"guest","OS":"macOS","Online":true,"TailscaleIPs":["100.3.3.3"],"UserID":9}}}
+             "c":{"HostName":"macbookpro","OS":"macOS","Online":true,"TailscaleIPs":["fd7a::2","100.76.63.21"],"CurAddr":"192.168.0.5:41641","Relay":"tok","UserID":7},
+             "d":{"HostName":"air","OS":"macOS","Online":true,"TailscaleIPs":["100.2.2.2"],"CurAddr":"","Relay":"tok","UserID":7},
+             "e":{"HostName":"guest","OS":"macOS","Online":true,"TailscaleIPs":["100.3.3.3"],"CurAddr":"","Relay":"","UserID":9}}}
     """
     let net = TailscaleDevice.parse(Data(fixture.utf8))!, d = net.devices
     precondition(net.login == "me@example.com" && d[2].ipv4 == "100.76.63.21")
     precondition(d.map(\.name) == ["Mac mini", "air", "macbookpro", "guest", "old mac", "z-fold7"])
     precondition(d.map(\.state) == [.thisMac, .online, .online, .otherAccount, .offline, .unsupported] && d[0].isSelf && d[0].stateText == "이 Mac" && d[3].stateText == "다른 계정")
-    precondition(d[2].path == "Tailscale 직접" && d[1].path == "Tailscale" && d[4].path == "—" && d[4].stateText == "오프라인" && d[5].stateText == "지원 안 함")
+    precondition(d[0].path == "—" && d[1].path == "Tailscale 중계" && d[2].path == "Tailscale 직접" && d[3].path == "Tailscale" && d[4].path == "—" && d[4].stateText == "오프라인" && d[5].stateText == "지원 안 함")
     precondition(TailscaleDevice.parse(Data("{\"BackendState\":\"Stopped\"}".utf8)) == nil && TailscaleDevice.parse(Data("nope".utf8)) == nil)
-    print("PASS Tailscale status JSON parsed: self first, own login, same/other account, online/offline/unsupported states, direct path, stopped and invalid output rejected")
-    let direct = Probe.parsePing("pong from macbookpro (100.76.63.21) via 192.168.45.194:41641 in 10ms\n")
-    let derp = Probe.parsePing("pong from z-fold7 (100.99.242.25) via DERP(tok) in 277.4ms\n")
-    precondition(direct?.latency == "10 ms" && direct?.route == "Tailscale 직접" && derp?.latency == "277 ms" && derp?.route == "Tailscale 중계")
-    for bad in ["timeout waiting for ping reply", "ping \"100.1.1.1\" timed out", "no matching peer", "", "pong from x (1.2.3.4) via DERP(tok) in fastms"] { precondition(Probe.parsePing(bad) == nil) }
-    print("PASS tailscale ping output parsed: direct 10 ms, DERP relay 277 ms, timeout and garbage give no latency")
+    print("PASS Tailscale status JSON parsed: self first, own login, same/other account, online/offline/unsupported states, direct/relay/fallback route, stopped and invalid output rejected")
     let whois = Data(#"{"Node":{"ID":1,"Name":"macbookpro.tail.ts.net."},"UserProfile":{"ID":2,"LoginName":"me@example.com","DisplayName":"Me"},"CapMap":{}}"#.utf8)
     precondition(whoisLogin(whois) == "me@example.com")
     precondition(tailnetAllows(whois: whois, selfLogin: "me@example.com"))
@@ -375,25 +370,29 @@ func uiModelTests() {
     print("PASS plain listener bind address is the 100.64.0.0/10 Tailscale address only, never LAN or link-local")
     let suite = "com.tamcut.Pulsar.selftest.\(UUID().uuidString)", defaults = UserDefaults(suiteName: suite)!
     defer { defaults.removePersistentDomain(forName: suite) }
-    precondition(ShortcutAction.disconnect.load(defaults).caps == ["⌃", "⌥", "⌘", "D"] && ShortcutAction.sendsSystem(defaults))
+    precondition(ShortcutAction.disconnect.load(defaults).caps == ["⌃", "⌥", "⇧", "Q"] && ShortcutAction.sendsSystem(defaults))
+    let legacy = Shortcut(keyCode: 2, modifiers: NSEvent.ModifierFlags([.control, .option, .command]).rawValue, key: "D")
+    ShortcutAction.disconnect.save(legacy, defaults)
+    precondition(ShortcutAction.disconnect.load(defaults) == ShortcutAction.disconnect.fallback)
     let custom = Shortcut(keyCode: 14, modifiers: NSEvent.ModifierFlags([.command, .shift]).rawValue, key: "E")
     ShortcutAction.overlay.save(custom, defaults)
     precondition(ShortcutAction.overlay.load(defaults) == custom && custom.caps == ["⇧", "⌘", "E"] && ShortcutAction.fullScreen.load(defaults) == ShortcutAction.fullScreen.fallback)
     defaults.set(Data("garbage".utf8), forKey: ShortcutAction.disconnect.defaultsKey)
     precondition(ShortcutAction.disconnect.load(defaults) == ShortcutAction.disconnect.fallback)
-    let plain = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, characters: "d", charactersIgnoringModifiers: "d", isARepeat: false, keyCode: 2)!
-    let combo = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.control, .option], timestamp: 0, windowNumber: 0, context: nil, characters: "k", charactersIgnoringModifiers: "k", isARepeat: false, keyCode: 40)!
-    precondition(Shortcut.from(plain) == nil && Shortcut.from(combo)?.caps == ["⌃", "⌥", "K"])
-    print("PASS shortcut encode/decode persistence, defaults, garbage fallback and modifier requirement")
     func key(_ c: String, _ code: UInt16, _ m: NSEvent.ModifierFlags, _ type: NSEvent.EventType = .keyDown) -> NSEvent {
         NSEvent.keyEvent(with: type, location: .zero, modifierFlags: m, timestamp: 0, windowNumber: 0, context: nil, characters: c, charactersIgnoringModifiers: c, isARepeat: false, keyCode: code)!
     }
+    let plain = key("d", 2, []), shiftOnly = key("q", 12, [.shift])
+    let shiftCombo = key("q", 12, [.control, .option, .shift]), combo = key("k", 40, [.control, .option])
+    precondition(Shortcut.from(plain) == nil && Shortcut.from(shiftOnly) == nil)
+    precondition(Shortcut.from(shiftCombo)?.caps == ["⌃", "⌥", "⇧", "Q"] && Shortcut.from(combo)?.caps == ["⌃", "⌥", "K"])
+    print("PASS shortcut encode/decode persistence, ⌃⌥⌘D migration to ⌃⌥⇧Q, garbage fallback and modifier requirement")
     let hyper: NSEvent.ModifierFlags = [.control, .option, .command]
-    precondition(ShortcutAction.matching(key("d", 2, hyper), defaults) == .disconnect && ShortcutAction.matching(key("f", 3, hyper), defaults) == .fullScreen)
+    precondition(ShortcutAction.matching(shiftCombo, defaults) == .disconnect && ShortcutAction.matching(key("f", 3, hyper), defaults) == .fullScreen)
     precondition(ShortcutAction.matching(key("e", 14, [.command, .shift]), defaults) == .overlay && ShortcutAction.matching(key("o", 31, hyper), defaults) == nil)
-    precondition(ShortcutAction.matching(key("d", 2, [.command]), defaults) == nil && ShortcutAction.matching(key("d", 2, hyper.union(.shift)), defaults) == nil)
-    precondition(ShortcutAction.matching(key("d", 2, hyper, .keyUp), defaults) == nil && ShortcutAction.matching(plain, defaults) == nil)
+    precondition(ShortcutAction.matching(key("q", 12, [.control, .option]), defaults) == nil && ShortcutAction.matching(key("q", 12, hyper.union(.shift)), defaults) == nil)
+    precondition(ShortcutAction.matching(key("q", 12, [.control, .option, .shift], .keyUp), defaults) == nil && ShortcutAction.matching(plain, defaults) == nil)
     precondition(ShortcutAction.fullScreen.conflict(ShortcutAction.disconnect.fallback, defaults) == .disconnect && ShortcutAction.disconnect.conflict(custom, defaults) == .overlay)
     precondition(ShortcutAction.disconnect.conflict(ShortcutAction.disconnect.fallback, defaults) == nil && ShortcutAction.disconnect.conflict(Shortcut.from(combo)!, defaults) == nil)
-    print("PASS saved session shortcuts consumed locally (⌃⌥⌘D, ⌃⌥⌘F, custom ⇧⌘E), other combos and keyUp forwarded; recorder rejects a combo used by another action")
+    print("PASS saved session shortcuts consumed locally (⌃⌥⇧Q, ⌃⌥⌘F, custom ⇧⌘E), other combos and keyUp forwarded; recorder rejects a combo used by another action")
 }
