@@ -183,22 +183,36 @@ struct TailscaleDevice: Equatable {
         }
         return Tailnet(devices: devices, login: owner.flatMap { s.User?[String($0)]?.LoginName })
     }
-    static let cli = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+    // The GUI app bundles the CLI; Homebrew/standalone installs put it on these paths instead.
+    static let candidates = ["/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale"]
+    static var cli: String? { candidates.first { FileManager.default.isExecutableFile(atPath: $0) } }
+    static var lastError = ""
     // Blocking; call off the main thread.
     static func run(_ args: [String], timeout: TimeInterval) -> (out: Data, ok: Bool)? {
-        let p = Process(), out = Pipe()
+        guard let cli = cli else { lastError = "Tailscale 실행 파일을 찾지 못했습니다."; return nil }
+        let p = Process(), out = Pipe(), err = Pipe()
         p.executableURL = URL(fileURLWithPath: cli); p.arguments = args
-        p.standardOutput = out; p.standardError = FileHandle.nullDevice
-        guard FileManager.default.isExecutableFile(atPath: cli), (try? p.run()) != nil else { return nil }
+        p.standardOutput = out; p.standardError = err
+        do { try p.run() } catch { lastError = "Tailscale을 실행하지 못했습니다: \(error.localizedDescription)"; return nil }
         let stop = DispatchWorkItem { if p.isRunning { p.terminate() } }
         DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: stop)
-        let data = out.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit(); stop.cancel()
-        return (data, p.terminationReason == .exit && p.terminationStatus == 0)
+        let data = out.fileHandleForReading.readDataToEndOfFile(); let e = err.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit(); stop.cancel()
+        let ok = p.terminationReason == .exit && p.terminationStatus == 0
+        if !ok {
+            let line = String(decoding: e.isEmpty ? data : e, as: UTF8.self).split(separator: "\n").first.map(String.init) ?? ""
+            lastError = p.terminationReason == .uncaughtSignal ? "Tailscale 응답이 \(Int(timeout))초 안에 오지 않았습니다." : "Tailscale 오류(\(p.terminationStatus)): \(line.prefix(160))"
+        }
+        return (data, ok)
     }
     static func fetch(_ done: @escaping (Tailnet?) -> Void) {
         DispatchQueue.global(qos: .utility).async {
-            let r = run(["status", "--json"], timeout: 5)
-            let result = r.flatMap { $0.ok ? parse($0.out) : nil }
+            let r = run(["status", "--json"], timeout: 8)
+            var result = r.flatMap { $0.ok ? parse($0.out) : nil }
+            if result == nil, let r = r, r.ok {
+                // Some CLI builds print a warning line before the JSON; parse from the first brace.
+                if let i = r.out.firstIndex(of: UInt8(ascii: "{")) { result = parse(r.out[i...]) }
+                if result == nil { lastError = "Tailscale 상태를 해석하지 못했습니다. 로그인과 연결 상태를 확인해 주세요." }
+            }
             DispatchQueue.main.async { done(result) }
         }
     }
@@ -414,7 +428,7 @@ final class ComputersPage: NSView, NSTableViewDataSource, NSTableViewDelegate {
         if loading { emptyTitle.stringValue = "Tailscale 기기를 확인하는 중…"; emptyBody.stringValue = "" }
         else if found == nil {
             emptyTitle.stringValue = "Tailscale 기기를 불러올 수 없습니다"
-            emptyBody.stringValue = "Pulsar는 같은 Tailscale 네트워크의 Mac을 이 목록에 보여 줍니다. Tailscale 앱을 설치하고 로그인해 연결하면 10초 안에 나타납니다. 연결코드로는 지금도 접속할 수 있습니다."
+            emptyBody.stringValue = "이유: \(TailscaleDevice.lastError.isEmpty ? "알 수 없음" : TailscaleDevice.lastError)\nTailscale 앱에서 로그인하고 연결됨 상태인지 확인해 주세요. 연결코드로는 지금도 접속할 수 있습니다."
         } else { emptyTitle.stringValue = "Tailscale 네트워크에 기기가 없습니다"; emptyBody.stringValue = "다른 Mac에서 같은 계정으로 Tailscale에 로그인하면 여기에 나타납니다." }
         table.reloadData()
     }
