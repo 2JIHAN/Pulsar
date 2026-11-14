@@ -168,7 +168,11 @@ struct TailscaleDevice: Equatable {
     // nil means Tailscale is not usable (bad output, logged out or stopped), which the list explains.
     static func parse(_ data: Data) -> Tailnet? {
         let s: Status
-        do { s = try JSONDecoder().decode(Status.self, from: data) } catch { lastError = "Tailscale 상태 JSON을 읽지 못했습니다: \(String(describing: error).prefix(160))"; return nil }
+        do { s = try JSONDecoder().decode(Status.self, from: data) } catch {
+            let head = String(decoding: data.prefix(120), as: UTF8.self).replacingOccurrences(of: "\n", with: " ")
+            lastError = data.isEmpty ? "Tailscale이 빈 응답을 보냈습니다." : "Tailscale 응답이 JSON이 아닙니다: \(head)"
+            return nil
+        }
         // The CLI exits 0 even when logged out or stopped, so the backend state is the real answer.
         guard s.BackendState == "Running" else {
             lastError = "Tailscale 상태가 \(s.BackendState ?? "알 수 없음")입니다(Running이어야 함). Tailscale이 두 종류 설치돼 있으면 Pulsar가 다른 쪽에 물어봤을 수 있습니다."
@@ -199,6 +203,9 @@ struct TailscaleDevice: Equatable {
         guard let cli = cli else { lastError = "Tailscale 실행 파일을 찾지 못했습니다."; return nil }
         let p = Process(), out = Pipe(), err = Pipe()
         p.executableURL = URL(fileURLWithPath: cli); p.arguments = args
+        // When the app-bundled binary is not started from a terminal, newer Tailscale builds may act as the GUI app
+        // instead of the CLI and print no JSON. This variable forces CLI mode.
+        var env = ProcessInfo.processInfo.environment; env["TAILSCALE_BE_CLI"] = "1"; p.environment = env
         p.standardOutput = out; p.standardError = err
         do { try p.run() } catch { lastError = "Tailscale을 실행하지 못했습니다: \(error.localizedDescription)"; return nil }
         let stop = DispatchWorkItem { if p.isRunning { p.terminate() } }
