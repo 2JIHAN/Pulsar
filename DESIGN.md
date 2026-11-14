@@ -77,7 +77,7 @@ A white and warm-grey ground with exactly two signal colours.
 - **SBB Navy** (#2D327D): the one primary action on a screen, the 연결 and 접속 buttons.
 
 ### Secondary
-- **Signal Red** (#EB0000): live state only (sharing, connected session dot) and disconnect actions (긴급 중지, 연결 종료).
+- **Signal Red** (#EB0000): live state only (this Mac or a listed Mac 공유 중, connected session dot) and disconnect actions (긴급 중지, 연결 종료).
 
 ### Neutral
 - **Ink** (#1E1E1E): text and sidebar icons.
@@ -109,6 +109,6 @@ None beyond the native window shadow. Groups are flat fills with 12px radius; ta
 
 ## Do's and Don'ts
 - Do keep the device list a ruled table.
-- Do label unfinished features honestly ("다음 버전에서 동작").
+- Do label unfinished features honestly; a disabled control says why in its tooltip ("상대 Mac에서 공유를 켜 주세요").
 - Don't use the system accent blue for selection.
 - Don't add thumbnails, gradients or neon to the device list.

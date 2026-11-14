@@ -108,7 +108,7 @@ final class TLSTest {
                     bad.onReady = { print("FAIL wrong key authenticated"); exit(1) }
                     bad.onClose = {
                         guard bad.failure != nil else { print("FAIL wrong key closed without TLS rejection state=\(bad.connection.state)"); exit(1) }
-                        var session = ViewerSession(); session.start(try! ConnectionCode.parse(ConnectionCode(host: "127.0.0.1", port: 1, token: try! ConnectionCode.randomToken()).text))
+                        var session = ViewerSession(); session.start(DialTarget(try! ConnectionCode.parse(ConnectionCode(host: "127.0.0.1", port: 1, token: try! ConnectionCode.randomToken()).text)))
                         guard session.closed(failure: bad.failure) == .wrongCode else { print("FAIL wrong key not classified as wrong code: \(String(describing: bad.failure))"); exit(1) }
                         print("PASS wrong TLS key rejected before application data and stops reconnecting (\(bad.failure!))")
                         self.replacement = HostReplacementTest(secret: self.secret); self.replacement!.start()
@@ -188,6 +188,65 @@ func videoTests() throws {
     precondition((try? VideoFrame.parse(Data([4, 0] + Array(repeating: unit, count: 256).joined()))) != nil)
     print("PASS oversized H.264 dimensions and \(bad.count) malformed video messages rejected")
 }
+var tailnet: TailnetHostTest?
+// Plain TCP host path with an injected authorizer standing in for `tailscale whois`.
+final class TailnetHostTest {
+    let host = HostPeers()
+    var listener: NWListener!
+    var allow = true
+    var asked = [String]()
+    var events = [String]()
+    var viewer: Peer?
+    var refused: Peer?
+    func client() -> Peer { Peer(NWConnection(host: "127.0.0.1", port: listener.port!, using: .tcp), greet: true) }
+    func fail(_ m: String) -> Never { print("FAIL \(m)"); exit(1) }
+    func start() {
+        do { listener = try plainListener(address: "127.0.0.1", port: 0) } catch { fail("plain listener") }
+        listener.newConnectionHandler = { [unowned self] c in host.acceptTailnet(c) { ip, done in self.asked.append(ip); done(self.allow) } }
+        host.onActive = { [unowned self] _ in events.append("active") }
+        host.onInactive = { [unowned self] in events.append("inactive") }
+        listener.stateUpdateHandler = { [unowned self] state in
+            guard case .ready = state else { return }
+            let v = client(); viewer = v
+            v.onClose = { self.fail("accepted tailnet viewer closed") }
+            v.onReady = { self.probe() }
+            v.start()
+        }
+        listener.start(queue: .main)
+    }
+    func probe() {
+        guard events == ["active"], asked == ["127.0.0.1"], host.active?.ready == true else { fail("tailnet viewer not active after authorize: \(events) \(asked)") }
+        let port = listener.port!.rawValue
+        DispatchQueue.global().async {
+            let open = (0..<3).map { _ in Probe.portOpen("127.0.0.1", port, timeout: 1.5) }
+            let lan = localAddresses().first { $0.1 != "127.0.0.1" }?.1
+            let other = lan.map { Probe.portOpen($0, port, timeout: 1.5) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.afterProbe(open, lan, other) }
+        }
+    }
+    func afterProbe(_ open: [Bool], _ lan: String?, _ other: Bool?) {
+        guard open == [true, true, true] else { fail("probe could not reach plain listener") }
+        guard events == ["active"], host.peers.count == 1, host.active === host.peers.first, viewer?.ready == true, viewer?.closed == false else {
+            fail("raw TCP probe disturbed the active peer: events=\(events) peers=\(host.peers.count)")
+        }
+        print("PASS plain tailnet host: authorizer asked for 127.0.0.1, hello completes; 3 raw TCP probes see the port open but never become a peer or evict the active viewer")
+        if let lan, let other {
+            guard !other else { fail("plain listener bound to 127.0.0.1 also answered on \(lan)") }
+            print("PASS plain listener bound to one address refuses the same port on this Mac's other address")
+        }
+        allow = false
+        let r = client(); refused = r
+        r.onReady = { self.fail("rejected viewer became ready") }
+        r.onClose = {
+            var s = ViewerSession(); s.start(DialTarget(tailnet: "127.0.0.1"))
+            guard r.connected, !r.ready, s.closed(failure: r.failure, refused: r.greet && r.connected) == .retry(attempt: 1),
+                  self.asked.count == 5, self.events == ["active"], self.viewer?.closed == false else { self.fail("rejection path state \(self.asked.count) \(self.events)") }
+            print("PASS authorizer rejection closes the new connection before hello (counted as a refusal), active viewer untouched")
+            print("SELF-TEST PASS"); exit(0)
+        }
+        r.start()
+    }
+}
 final class HostReplacementTest {
     let secret: Data
     let host = HostPeers()
@@ -223,7 +282,7 @@ final class HostReplacementTest {
         guard firstClosed, events == ["active", "inactive", "active"] else { return }
         guard host.peers.count == 1, host.active === host.peers.first, host.active?.ready == true, second?.ready == true else { print("FAIL host replacement state"); exit(1) }
         print("PASS host accepts a second authenticated viewer, closes the first and keeps one active peer")
-        print("SELF-TEST PASS"); exit(0)
+        tailnet = TailnetHostTest(); tailnet!.start()
     }
 }
 func gestureFixture(_ subtype: Int64, phase: Int64, scalar: Double) -> CGEvent {
@@ -262,29 +321,58 @@ func gestureTests(injector: InputInjector) throws {
 }
 func sessionTests(_ code: ConnectionCode) {
     let t0 = Date(timeIntervalSince1970: 1000)
+    let code = DialTarget(code)
     var s = ViewerSession(); s.start(code)
     precondition(s.closed(failure: nil, now: t0) == .retry(attempt: 1) && s.closed(failure: .posix(.ETIMEDOUT), now: t0 + 2) == .retry(attempt: 2))
     s.connected()
     precondition(s.closed(failure: .tls(-9806), now: t0 + 10) == .retry(attempt: 1))
-    precondition(s.closed(failure: nil, now: t0 + 129) == .retry(attempt: 2) && s.closed(failure: nil, now: t0 + 130) == .giveUp && s.code == nil)
-    s.start(code); precondition(s.closed(failure: .tls(-9820)) == .wrongCode && s.code == nil)
+    precondition(s.closed(failure: nil, now: t0 + 129) == .retry(attempt: 2) && s.closed(failure: nil, now: t0 + 130) == .giveUp && s.target == nil)
+    s.start(code); precondition(s.closed(failure: .tls(-9820)) == .wrongCode && s.target == nil)
     s.start(code); let g = s.generation; s.stop(); precondition(s.generation != g && s.closed(failure: nil) == .idle)
     print("PASS viewer session retries non-user closes every \(Int(ViewerSession.retryDelay))s for 2 minutes, stops on wrong code and user stop")
+    let tail = DialTarget(tailnet: "100.76.63.21")
+    precondition(tail.port == 47700 && tail.secret == nil)
+    s.start(tail)
+    precondition(s.closed(failure: nil, refused: true) == .retry(attempt: 1) && s.closed(failure: nil, refused: true) == .retry(attempt: 2))
+    precondition(s.closed(failure: .posix(.ECONNREFUSED)) == .retry(attempt: 3) && s.closed(failure: nil, refused: true) == .retry(attempt: 4))
+    precondition(s.closed(failure: nil, refused: true) == .retry(attempt: 5) && s.closed(failure: nil, refused: true) == .refused && s.target == nil)
+    s.start(tail); _ = s.closed(failure: nil, refused: true); _ = s.closed(failure: nil, refused: true); s.connected()
+    precondition(s.closed(failure: nil, refused: true) == .retry(attempt: 1))
+    print("PASS tailnet dial stops after \(ViewerSession.refusalLimit) consecutive host refusals; a refused-port close or an accepted session resets the count")
 }
 func uiModelTests() {
     let fixture = """
-    {"BackendState":"Running","Self":{"HostName":"Mac mini","OS":"macOS","Online":true,"TailscaleIPs":["100.116.229.75"]},
-     "Peer":{"a":{"HostName":"z-fold7","OS":"android","Online":true,"TailscaleIPs":["100.99.0.1"]},
-             "b":{"HostName":"old\\u00a0mac","OS":"macOS","Online":false,"TailscaleIPs":["100.1.1.1"]},
-             "c":{"HostName":"macbookpro","OS":"macOS","Online":true,"TailscaleIPs":["100.76.63.21"],"CurAddr":"192.168.0.5:41641"},
-             "d":{"HostName":"air","OS":"macOS","Online":true,"TailscaleIPs":["100.2.2.2"],"CurAddr":""}}}
+    {"BackendState":"Running","Self":{"HostName":"Mac mini","OS":"macOS","Online":true,"TailscaleIPs":["100.116.229.75","fd7a::1"],"UserID":7},
+     "User":{"7":{"LoginName":"me@example.com"},"9":{"LoginName":"guest@example.com"}},
+     "Peer":{"a":{"HostName":"z-fold7","OS":"android","Online":true,"TailscaleIPs":["100.99.0.1"],"UserID":7},
+             "b":{"HostName":"old\\u00a0mac","OS":"macOS","Online":false,"TailscaleIPs":["100.1.1.1"],"UserID":7},
+             "c":{"HostName":"macbookpro","OS":"macOS","Online":true,"TailscaleIPs":["fd7a::2","100.76.63.21"],"CurAddr":"192.168.0.5:41641","UserID":7},
+             "d":{"HostName":"air","OS":"macOS","Online":true,"TailscaleIPs":["100.2.2.2"],"CurAddr":"","UserID":7},
+             "e":{"HostName":"guest","OS":"macOS","Online":true,"TailscaleIPs":["100.3.3.3"],"UserID":9}}}
     """
-    let d = TailscaleDevice.parse(Data(fixture.utf8))!
-    precondition(d.map(\.name) == ["Mac mini", "air", "macbookpro", "old mac", "z-fold7"])
-    precondition(d.map(\.state) == [.thisMac, .online, .online, .offline, .unsupported] && d[0].isSelf && d[0].stateText == "이 Mac")
-    precondition(d[2].path == "Tailscale 직접" && d[1].path == "Tailscale" && d[3].path == "—" && d[3].stateText == "오프라인" && d[4].stateText == "지원 안 함")
+    let net = TailscaleDevice.parse(Data(fixture.utf8))!, d = net.devices
+    precondition(net.login == "me@example.com" && d[2].ipv4 == "100.76.63.21")
+    precondition(d.map(\.name) == ["Mac mini", "air", "macbookpro", "guest", "old mac", "z-fold7"])
+    precondition(d.map(\.state) == [.thisMac, .online, .online, .otherAccount, .offline, .unsupported] && d[0].isSelf && d[0].stateText == "이 Mac" && d[3].stateText == "다른 계정")
+    precondition(d[2].path == "Tailscale 직접" && d[1].path == "Tailscale" && d[4].path == "—" && d[4].stateText == "오프라인" && d[5].stateText == "지원 안 함")
     precondition(TailscaleDevice.parse(Data("{\"BackendState\":\"Stopped\"}".utf8)) == nil && TailscaleDevice.parse(Data("nope".utf8)) == nil)
-    print("PASS Tailscale status JSON parsed: self first, online/offline/unsupported states, direct path, stopped and invalid output rejected")
+    print("PASS Tailscale status JSON parsed: self first, own login, same/other account, online/offline/unsupported states, direct path, stopped and invalid output rejected")
+    let direct = Probe.parsePing("pong from macbookpro (100.76.63.21) via 192.168.45.194:41641 in 10ms\n")
+    let derp = Probe.parsePing("pong from z-fold7 (100.99.242.25) via DERP(tok) in 277.4ms\n")
+    precondition(direct?.latency == "10 ms" && direct?.route == "Tailscale 직접" && derp?.latency == "277 ms" && derp?.route == "Tailscale 중계")
+    for bad in ["timeout waiting for ping reply", "ping \"100.1.1.1\" timed out", "no matching peer", "", "pong from x (1.2.3.4) via DERP(tok) in fastms"] { precondition(Probe.parsePing(bad) == nil) }
+    print("PASS tailscale ping output parsed: direct 10 ms, DERP relay 277 ms, timeout and garbage give no latency")
+    let whois = Data(#"{"Node":{"ID":1,"Name":"macbookpro.tail.ts.net."},"UserProfile":{"ID":2,"LoginName":"me@example.com","DisplayName":"Me"},"CapMap":{}}"#.utf8)
+    precondition(whoisLogin(whois) == "me@example.com")
+    precondition(tailnetAllows(whois: whois, selfLogin: "me@example.com"))
+    precondition(!tailnetAllows(whois: whois, selfLogin: "guest@example.com") && !tailnetAllows(whois: whois, selfLogin: nil) && !tailnetAllows(whois: whois, selfLogin: ""))
+    for bad in [nil, Data(), Data("peer not found".utf8), Data(#"{"UserProfile":{"LoginName":""}}"#.utf8), Data(#"{"Node":{}}"#.utf8)] as [Data?] {
+        precondition(!tailnetAllows(whois: bad, selfLogin: "me@example.com"))
+    }
+    print("PASS whois login parsed; same account allowed, other account, missing/garbage whois and unknown own login rejected (fail closed)")
+    precondition(tailnetBindAddress(["192.168.45.10", "169.254.3.1", "100.116.229.75"]) == "100.116.229.75")
+    precondition(tailnetBindAddress(["192.168.45.10", "100.200.1.1", "100.63.0.1", "10.0.0.2"]) == nil && tailnetBindAddress([]) == nil)
+    print("PASS plain listener bind address is the 100.64.0.0/10 Tailscale address only, never LAN or link-local")
     let suite = "com.tamcut.Pulsar.selftest.\(UUID().uuidString)", defaults = UserDefaults(suiteName: suite)!
     defer { defaults.removePersistentDomain(forName: suite) }
     precondition(ShortcutAction.disconnect.load(defaults).caps == ["⌃", "⌥", "⌘", "D"] && ShortcutAction.sendsSystem(defaults))
@@ -297,4 +385,15 @@ func uiModelTests() {
     let combo = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.control, .option], timestamp: 0, windowNumber: 0, context: nil, characters: "k", charactersIgnoringModifiers: "k", isARepeat: false, keyCode: 40)!
     precondition(Shortcut.from(plain) == nil && Shortcut.from(combo)?.caps == ["⌃", "⌥", "K"])
     print("PASS shortcut encode/decode persistence, defaults, garbage fallback and modifier requirement")
+    func key(_ c: String, _ code: UInt16, _ m: NSEvent.ModifierFlags, _ type: NSEvent.EventType = .keyDown) -> NSEvent {
+        NSEvent.keyEvent(with: type, location: .zero, modifierFlags: m, timestamp: 0, windowNumber: 0, context: nil, characters: c, charactersIgnoringModifiers: c, isARepeat: false, keyCode: code)!
+    }
+    let hyper: NSEvent.ModifierFlags = [.control, .option, .command]
+    precondition(ShortcutAction.matching(key("d", 2, hyper), defaults) == .disconnect && ShortcutAction.matching(key("f", 3, hyper), defaults) == .fullScreen)
+    precondition(ShortcutAction.matching(key("e", 14, [.command, .shift]), defaults) == .overlay && ShortcutAction.matching(key("o", 31, hyper), defaults) == nil)
+    precondition(ShortcutAction.matching(key("d", 2, [.command]), defaults) == nil && ShortcutAction.matching(key("d", 2, hyper.union(.shift)), defaults) == nil)
+    precondition(ShortcutAction.matching(key("d", 2, hyper, .keyUp), defaults) == nil && ShortcutAction.matching(plain, defaults) == nil)
+    precondition(ShortcutAction.fullScreen.conflict(ShortcutAction.disconnect.fallback, defaults) == .disconnect && ShortcutAction.disconnect.conflict(custom, defaults) == .overlay)
+    precondition(ShortcutAction.disconnect.conflict(ShortcutAction.disconnect.fallback, defaults) == nil && ShortcutAction.disconnect.conflict(Shortcut.from(combo)!, defaults) == nil)
+    print("PASS saved session shortcuts consumed locally (⌃⌥⌘D, ⌃⌥⌘F, custom ⇧⌘E), other combos and keyUp forwarded; recorder rejects a combo used by another action")
 }

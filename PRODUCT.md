@@ -20,14 +20,14 @@ A personal, Parsec-like remote desktop for the owner's own Macs that rides the o
 ## Operating Context
 - Host Mac runs Pulsar with sharing on; viewer Mac connects to it.
 - Cross-network reach comes from Tailscale on both Macs (direct path measured around 8 ms in testing); LAN works directly.
-- Connections are authenticated by a per-session pre-shared key carried in a connection code (TLS 1.2 ECDHE-PSK). One active viewer per host.
+- Same-account Macs connect from the device list over Tailscale (plain TCP on port 47700, host checks the peer owner with `tailscale whois`). Other Macs use a per-session pre-shared key carried in a connection code (TLS 1.2 ECDHE-PSK). One active viewer per host.
 - The viewer auto-reconnects for up to 2 minutes after a network drop and keeps the last frame visible.
 - macOS permissions gate features: Screen Recording (host), "Device control and data access" (macOS 27 name of Accessibility; host input, viewer system shortcuts), Input Monitoring (viewer shortcuts and gestures).
 
 ## Capabilities and Constraints
 - Video: H.264 hardware encoding, up to 1920x1200, up to 30 fps, one display.
 - Input: mouse, scroll, keyboard, app shortcuts, system shortcuts while the viewer is focused, pinch/rotate/smart magnify/swipe gestures (same macOS build required). 3/4-finger Dock gestures are not supported.
-- Undecided: one-tap connect from a device list requires remembered pairing instead of pasting a per-session code; customizable disconnect/overlay shortcuts are requested but not implemented yet.
+- One-tap connect works for Macs on the same Tailscale account; sharing can start automatically at launch. Disconnect, overlay and full-screen shortcuts are user-configurable and handled locally during a session.
 
 ## Brand Commitments
 - Name: Pulsar (a pulsar is a neutron star emitting regular pulses), chosen by the user.

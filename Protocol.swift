@@ -148,6 +148,33 @@ func tlsParameters(secret: Data) -> NWParameters {
     p.allowLocalEndpointReuse = true
     return p
 }
+// Same-account Macs connect over Tailscale without TLS: WireGuard already encrypts and
+// authenticates each node, and the host checks the source IP's owner with `tailscale whois`.
+let tailnetPort: UInt16 = 47700
+// The plain listener must only be reachable on the Tailscale interface, never on the LAN.
+func tailnetBindAddress(_ ips: [String]) -> String? {
+    ips.first { ip in
+        let p = ip.split(separator: ".").compactMap { Int($0) }
+        return p.count == 4 && p[0] == 100 && (64...127).contains(p[1])
+    }
+}
+func plainListener(address: String, port: UInt16) throws -> NWListener {
+    let p = NWParameters.tcp
+    p.allowLocalEndpointReuse = true
+    p.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(address), port: NWEndpoint.Port(rawValue: port) ?? .any)
+    return try NWListener(using: p)
+}
+func whoisLogin(_ data: Data) -> String? {
+    struct Profile: Decodable { var LoginName: String? }
+    struct Whois: Decodable { var UserProfile: Profile? }
+    guard let login = (try? JSONDecoder().decode(Whois.self, from: data))?.UserProfile?.LoginName, !login.isEmpty else { return nil }
+    return login
+}
+// Fails closed: no whois answer, unparseable output or an unknown own login all reject.
+func tailnetAllows(whois: Data?, selfLogin: String?) -> Bool {
+    guard let whois, let selfLogin, !selfLogin.isEmpty, let login = whoisLogin(whois) else { return false }
+    return login == selfLogin
+}
 final class Peer {
     let connection: NWConnection
     var onPacket: ((Data) -> Void)?
@@ -159,12 +186,21 @@ final class Peer {
     var closed = false
     var lastReceive = Date()
     var pendingControl = 0
-    init(_ connection: NWConnection) { self.connection = connection }
+    // Plain TCP is "ready" as soon as a SYN completes, which a port probe also does, so both
+    // ends exchange a hello first and only then count as ready.
+    static let hello = Data("PULSAR1".utf8)
+    let greet: Bool
+    private(set) var connected = false
+    init(_ connection: NWConnection, greet: Bool = false) { self.connection = connection; self.greet = greet }
     func start() {
         connection.stateUpdateHandler = { [weak self] state in
             guard let self = self, !self.closed else { return }
             switch state {
-            case .ready: self.ready = true; self.onReady?(); self.receive()
+            case .ready where self.greet:
+                self.connected = true
+                self.connection.send(content: PacketParser.frame(Self.hello), completion: .contentProcessed { [weak self] e in if e != nil { self?.close() } })
+                self.receive()
+            case .ready: self.connected = true; self.ready = true; self.onReady?(); self.receive()
             case .failed(let error): self.failure = error; self.close()
             case .cancelled: self.close()
             case .waiting(let error): if case .tls = error { self.failure = error; self.close() }
@@ -179,7 +215,16 @@ final class Peer {
             guard let self = self, !self.closed else { return }
             if let data = data, !data.isEmpty {
                 self.lastReceive = Date()
-                do { for packet in try self.parser.feed(data) { guard !self.closed else { return }; self.onPacket?(packet) } }
+                do {
+                    for packet in try self.parser.feed(data) {
+                        guard !self.closed else { return }
+                        if !self.ready {
+                            guard packet == Self.hello else { self.close(); return }
+                            self.ready = true; self.onReady?(); continue
+                        }
+                        self.onPacket?(packet)
+                    }
+                }
                 catch { self.close(); return }
             }
             if complete || error != nil { if let error = error { self.failure = error }; self.close() } else { self.receive() }
@@ -216,9 +261,10 @@ final class HostPeers {
     var onActive: ((Peer) -> Void)?
     var onInactive: (() -> Void)?
     var onPacket: ((Peer, Data) -> Void)?
-    func accept(_ c: NWConnection) {
+    private var authorizing = 0
+    func accept(_ c: NWConnection, greet: Bool = false) {
         guard peers.filter({ $0 !== active }).count < 3 else { c.cancel(); return }
-        let p = Peer(c); peers.append(p)
+        let p = Peer(c, greet: greet); peers.append(p)
         p.onReady = { [weak self, weak p] in
             guard let self, let p else { return }
             self.active?.close()
@@ -233,25 +279,51 @@ final class HostPeers {
         }
         p.start()
     }
+    // `authorize` answers on the main queue whether the source IP belongs to this Mac's account.
+    // Nothing is read from the connection until then.
+    func acceptTailnet(_ c: NWConnection, authorize: @escaping (String, @escaping (Bool) -> Void) -> Void) {
+        guard authorizing < 3, case .hostPort(let host, _) = c.endpoint else { c.cancel(); return }
+        authorizing += 1
+        let ip = "\(host)".split(separator: "%").first.map(String.init) ?? ""
+        authorize(ip) { [weak self] ok in
+            guard let self else { c.cancel(); return }
+            self.authorizing -= 1
+            if ok { self.accept(c, greet: true) } else { c.cancel() }
+        }
+    }
     func closeAll() { for p in peers { p.close() }; peers.removeAll(); active = nil }
 }
-// Holds the code while the user wants a connection, so any close the user did not ask for redials.
+// A connection code dials with its TLS key; a same-account Tailscale Mac dials plain TCP (secret nil).
+struct DialTarget: Equatable {
+    let host: String
+    let port: UInt16
+    let secret: Data?
+    init(_ c: ConnectionCode) { host = c.host; port = c.port; secret = c.secret }
+    init(tailnet host: String) { self.host = host; port = tailnetPort; secret = nil }
+}
+// Holds the target while the user wants a connection, so any close the user did not ask for redials.
 struct ViewerSession {
-    enum Decision: Equatable { case idle, wrongCode, retry(attempt: Int), giveUp }
-    static let retryDelay: TimeInterval = 2, retryWindow: TimeInterval = 120, silenceLimit: TimeInterval = 6
-    private(set) var code: ConnectionCode?
+    enum Decision: Equatable { case idle, wrongCode, refused, retry(attempt: Int), giveUp }
+    static let retryDelay: TimeInterval = 2, retryWindow: TimeInterval = 120, silenceLimit: TimeInterval = 6, refusalLimit = 3
+    private(set) var target: DialTarget?
     private(set) var generation = 0
     private(set) var attempts = 0
+    private var refusals = 0
     private var live = false
     private var since: Date?
-    mutating func start(_ c: ConnectionCode) { stop(); code = c }
-    mutating func stop() { code = nil; generation += 1; attempts = 0; live = false; since = nil }
-    mutating func connected() { live = true; attempts = 0; since = nil }
-    mutating func closed(failure: NWError?, now: Date = Date()) -> Decision {
-        guard code != nil else { return .idle }
+    mutating func start(_ t: DialTarget) { stop(); target = t }
+    mutating func stop() { target = nil; generation += 1; attempts = 0; refusals = 0; live = false; since = nil }
+    mutating func connected() { live = true; attempts = 0; refusals = 0; since = nil }
+    // `refused`: TCP connected but the host closed before its hello, which is what a whois rejection looks like.
+    mutating func closed(failure: NWError?, refused: Bool = false, now: Date = Date()) -> Decision {
+        guard target != nil else { return .idle }
         let wasLive = live; live = false
         // Only an attempt that never finished the handshake can be a PSK mismatch.
         if !wasLive, case .tls = failure { stop(); return .wrongCode }
+        if !wasLive && refused {
+            refusals += 1
+            if refusals >= Self.refusalLimit { stop(); return .refused }
+        } else { refusals = 0 }
         let start = since ?? now; since = start
         guard now.timeIntervalSince(start) < Self.retryWindow else { stop(); return .giveUp }
         attempts += 1

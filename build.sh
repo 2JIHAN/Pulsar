@@ -11,15 +11,15 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>com.tamcut.Pulsar</string>
 <key>CFBundleName</key><string>Pulsar</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.4.0</string>
-<key>CFBundleVersion</key><string>8</string>
+<key>CFBundleShortVersionString</key><string>0.5.0</string>
+<key>CFBundleVersion</key><string>9</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSLocalNetworkUsageDescription</key><string>선택한 Mac과 암호화된 화면 및 입력 연결을 만듭니다.</string>
 <key>NSScreenCaptureUsageDescription</key><string>연결한 Mac에 화면을 공유합니다.</string>
 </dict></plist>
 PLIST
-swiftc -swift-version 5 -O -target arm64-apple-macos14.0 -framework AppKit -framework ScreenCaptureKit -framework Network -framework Security -framework ApplicationServices -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework AVFoundation -framework Carbon Protocol.swift Capture.swift App.swift Pages.swift Permissions.swift Tests.swift main.swift -o "$APP/Contents/MacOS/Pulsar"
+swiftc -swift-version 5 -O -target arm64-apple-macos14.0 -framework AppKit -framework ScreenCaptureKit -framework Network -framework Security -framework ApplicationServices -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework AVFoundation -framework Carbon -framework ServiceManagement Protocol.swift Capture.swift App.swift Pages.swift Permissions.swift Tests.swift main.swift -o "$APP/Contents/MacOS/Pulsar"
 codesign --force --sign - "$APP"
 /bin/bash scripts/clear-quarantine.sh "$APP"
 codesign --verify --strict "$APP"
