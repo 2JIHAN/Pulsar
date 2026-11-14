@@ -167,7 +167,13 @@ struct TailscaleDevice: Equatable {
     struct Tailnet { var devices: [TailscaleDevice]; var login: String? }
     // nil means Tailscale is not usable (bad output, logged out or stopped), which the list explains.
     static func parse(_ data: Data) -> Tailnet? {
-        guard let s = try? JSONDecoder().decode(Status.self, from: data), s.BackendState == "Running" else { return nil }
+        let s: Status
+        do { s = try JSONDecoder().decode(Status.self, from: data) } catch { lastError = "Tailscale 상태 JSON을 읽지 못했습니다: \(String(describing: error).prefix(160))"; return nil }
+        // The CLI exits 0 even when logged out or stopped, so the backend state is the real answer.
+        guard s.BackendState == "Running" else {
+            lastError = "Tailscale 상태가 \(s.BackendState ?? "알 수 없음")입니다(Running이어야 함). Tailscale이 두 종류 설치돼 있으면 Pulsar가 다른 쪽에 물어봤을 수 있습니다."
+            return nil
+        }
         let owner = s.me?.UserID
         func device(_ n: Node, isSelf: Bool) -> TailscaleDevice {
             TailscaleDevice(name: (n.HostName ?? "이름 없음").replacingOccurrences(of: "\u{00A0}", with: " "), os: n.OS ?? "",
@@ -186,6 +192,7 @@ struct TailscaleDevice: Equatable {
     // The GUI app bundles the CLI; Homebrew/standalone installs put it on these paths instead.
     static let candidates = ["/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale"]
     static var cli: String? { candidates.first { FileManager.default.isExecutableFile(atPath: $0) } }
+    static var cliDescription: String { cli ?? "없음" }
     static var lastError = ""
     // Blocking; call off the main thread.
     static func run(_ args: [String], timeout: TimeInterval) -> (out: Data, ok: Bool)? {
@@ -211,7 +218,6 @@ struct TailscaleDevice: Equatable {
             if result == nil, let r = r, r.ok {
                 // Some CLI builds print a warning line before the JSON; parse from the first brace.
                 if let i = r.out.firstIndex(of: UInt8(ascii: "{")) { result = parse(r.out[i...]) }
-                if result == nil { lastError = "Tailscale 상태를 해석하지 못했습니다. 로그인과 연결 상태를 확인해 주세요." }
             }
             DispatchQueue.main.async { done(result) }
         }
