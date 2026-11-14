@@ -5,3 +5,5 @@ rea-evidence.json
 VERIFICATION.md
 AUTOCLEAN-VERIFICATION.md
 .DS_Store
+.impeccable/shots/
+.impeccable/decision-payload.json

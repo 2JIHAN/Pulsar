@@ -1,0 +1,10 @@
+{"schemaVersion":2,"generatedAt":"2026-11-14T15:30:00+09:00","title":"Design System: Pulsar",
+ "extensions":{"colorMeta":{"navy":{"role":"primary","displayName":"SBB Navy"},"signal-red":{"role":"secondary","displayName":"Signal Red"},"ink":{"role":"neutral","displayName":"Ink"}},
+ "typographyMeta":{"heading":{"displayName":"Heading","purpose":"Page titles"}},
+ "motion":[{"name":"board-fade","value":"200ms ease-out","purpose":"Session board show/hide"},{"name":"live-pulse","value":"250ms ease-out every 1s","purpose":"Live dot"}]},
+ "components":[
+  {"name":"Primary Button","kind":"button","refersTo":"button-primary","description":"The one primary action.","html":"<button class=\"p-btn\">연결</button>","css":".p-btn{background:#2D327D;color:#fff;border:0;border-radius:6px;padding:4px 18px;font:600 13px -apple-system}"},
+  {"name":"Device Row","kind":"custom","description":"Departure-board row.","html":"<div class=\"p-row\"><b>mac-mini</b><span>Tailscale 직접</span><span>—</span><span><i></i> 온라인</span></div>","css":".p-row{display:grid;grid-template-columns:2fr 1fr 1fr 1fr;height:44px;align-items:center;border-bottom:1px solid #E3E3E0;font:13px -apple-system;color:#1E1E1E} .p-row i{display:inline-block;width:8px;height:8px;border-radius:50%;background:#1E1E1E}"}],
+ "narrative":{"northStar":"The departure board","keyCharacteristics":["Ruled table","Flat colour","Colour is state","Native controls"],
+  "rules":[{"name":"The Station Clock Rule","body":"Red means live or stop.","section":"colors"},{"name":"The One Train Rule","body":"One navy action per region.","section":"colors"}],
+  "dos":["Keep the device list a ruled table"],"donts":["Don't use accent blue for selection"]}}

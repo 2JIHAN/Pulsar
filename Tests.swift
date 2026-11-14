@@ -61,6 +61,7 @@ func runSelfTests() {
         precondition(pushes == 1 && pops == [hotToken])
         hot.set(true); hot.set(false); precondition(pushes == 2 && pops.count == 2)
         print("PASS symbolic hot key mode push/pop balanced with the pushed token, no double pop")
+        uiModelTests()
         let test = TLSTest(secret: decoded.secret); test.start(); dispatchMain()
     } catch { print("FAIL pure protocol tests"); exit(1) }
 }
@@ -269,4 +270,31 @@ func sessionTests(_ code: ConnectionCode) {
     s.start(code); precondition(s.closed(failure: .tls(-9820)) == .wrongCode && s.code == nil)
     s.start(code); let g = s.generation; s.stop(); precondition(s.generation != g && s.closed(failure: nil) == .idle)
     print("PASS viewer session retries non-user closes every \(Int(ViewerSession.retryDelay))s for 2 minutes, stops on wrong code and user stop")
+}
+func uiModelTests() {
+    let fixture = """
+    {"BackendState":"Running","Self":{"HostName":"Mac mini","OS":"macOS","Online":true,"TailscaleIPs":["100.116.229.75"]},
+     "Peer":{"a":{"HostName":"z-fold7","OS":"android","Online":true,"TailscaleIPs":["100.99.0.1"]},
+             "b":{"HostName":"old\\u00a0mac","OS":"macOS","Online":false,"TailscaleIPs":["100.1.1.1"]},
+             "c":{"HostName":"macbookpro","OS":"macOS","Online":true,"TailscaleIPs":["100.76.63.21"],"CurAddr":"192.168.0.5:41641"},
+             "d":{"HostName":"air","OS":"macOS","Online":true,"TailscaleIPs":["100.2.2.2"],"CurAddr":""}}}
+    """
+    let d = TailscaleDevice.parse(Data(fixture.utf8))!
+    precondition(d.map(\.name) == ["Mac mini", "air", "macbookpro", "old mac", "z-fold7"])
+    precondition(d.map(\.state) == [.thisMac, .online, .online, .offline, .unsupported] && d[0].isSelf && d[0].stateText == "이 Mac")
+    precondition(d[2].path == "Tailscale 직접" && d[1].path == "Tailscale" && d[3].path == "—" && d[3].stateText == "오프라인" && d[4].stateText == "지원 안 함")
+    precondition(TailscaleDevice.parse(Data("{\"BackendState\":\"Stopped\"}".utf8)) == nil && TailscaleDevice.parse(Data("nope".utf8)) == nil)
+    print("PASS Tailscale status JSON parsed: self first, online/offline/unsupported states, direct path, stopped and invalid output rejected")
+    let suite = "com.tamcut.Pulsar.selftest.\(UUID().uuidString)", defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    precondition(ShortcutAction.disconnect.load(defaults).caps == ["⌃", "⌥", "⌘", "D"] && ShortcutAction.sendsSystem(defaults))
+    let custom = Shortcut(keyCode: 14, modifiers: NSEvent.ModifierFlags([.command, .shift]).rawValue, key: "E")
+    ShortcutAction.overlay.save(custom, defaults)
+    precondition(ShortcutAction.overlay.load(defaults) == custom && custom.caps == ["⇧", "⌘", "E"] && ShortcutAction.fullScreen.load(defaults) == ShortcutAction.fullScreen.fallback)
+    defaults.set(Data("garbage".utf8), forKey: ShortcutAction.disconnect.defaultsKey)
+    precondition(ShortcutAction.disconnect.load(defaults) == ShortcutAction.disconnect.fallback)
+    let plain = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, characters: "d", charactersIgnoringModifiers: "d", isARepeat: false, keyCode: 2)!
+    let combo = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.control, .option], timestamp: 0, windowNumber: 0, context: nil, characters: "k", charactersIgnoringModifiers: "k", isARepeat: false, keyCode: 40)!
+    precondition(Shortcut.from(plain) == nil && Shortcut.from(combo)?.caps == ["⌃", "⌥", "K"])
+    print("PASS shortcut encode/decode persistence, defaults, garbage fallback and modifier requirement")
 }
