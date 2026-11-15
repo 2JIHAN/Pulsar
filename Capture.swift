@@ -14,6 +14,7 @@ final class VideoEncoder {
 
     private let session: VTCompressionSession
     let effectiveQuality: EffectiveQuality
+    private let stream: UInt8?
     private let onOutput: (Data?) -> Void
 
     private static func makeSession(width: Int, height: Int, quality: EffectiveQuality) -> VTCompressionSession? {
@@ -48,7 +49,7 @@ final class VideoEncoder {
     }
 
     // onOutput runs on a VideoToolbox thread with a wire message, or nil when the frame was dropped.
-    init(width: Int, height: Int, quality: EffectiveQuality = .legacyDefaults, onOutput: @escaping (Data?) -> Void) throws {
+    init(width: Int, height: Int, quality: EffectiveQuality = .legacyDefaults, stream: UInt8? = nil, onOutput: @escaping (Data?) -> Void) throws {
         var resolved = quality
         var created = Self.makeSession(width: width, height: height, quality: resolved)
         if created == nil, resolved.codec == .hevc && resolved.chroma == .yuv444 {
@@ -58,14 +59,15 @@ final class VideoEncoder {
         guard let session = created else { throw WireError.invalid }
         self.session = session
         self.effectiveQuality = resolved
+        self.stream = stream
         self.onOutput = onOutput
     }
     deinit { VTCompressionSessionInvalidate(session) }
     func encode(_ pixel: CVImageBuffer, time: CMTime, keyframe: Bool) -> Bool {
         let options = keyframe ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
-        let codec = effectiveQuality.codec
+        let codec = effectiveQuality.codec, stream = stream
         return VTCompressionSessionEncodeFrame(session, imageBuffer: pixel, presentationTimeStamp: time, duration: .invalid, frameProperties: options, infoFlagsOut: nil) { [onOutput] status, _, sample in
-            onOutput(status == noErr ? sample.flatMap { videoMessage($0, codec: codec) } : nil)
+            onOutput(status == noErr ? sample.flatMap { videoMessage($0, codec: codec, stream: stream) } : nil)
         } == noErr
     }
 }
@@ -102,9 +104,6 @@ final class VirtualDisplay {
         self.pixelHeight = pixelH
         self.scale = scale
 
-        // Do not touch the display configuration here. Measured on macOS 27: any CGBeginDisplayConfiguration
-        // that names this display pins it until the process exits, so releasing it would leave a stale
-        // screen after every session. macOS already adds it as an extended display right of the others.
     }
 
     func destroy() { handle = nil }
@@ -117,6 +116,10 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     var onFrame: ((Data, @escaping () -> Void) -> Void)?
     var onError: ((String) -> Void)?
     var rect = CGRect.zero
+    var displayID: CGDirectDisplayID = 0
+    var outputSize = (width: 0, height: 0)
+    // Viewer screen id written into every frame; nil keeps the 0.8 wire format.
+    var streamIndex: UInt8?
     var active = false
     private var stopped = false
     private let queue = DispatchQueue(label: "Pulsar.capture")
@@ -125,7 +128,9 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     // because dropping an encoded frame would break the decoder's reference chain.
     private var inFlight = 0
     private var needsKeyframe = true
-    @MainActor func start(request: QualityRequest? = nil, targetDisplayID: CGDirectDisplayID? = nil, fallbackPixelSize: (Int, Int)? = nil) async throws -> EffectiveQuality {
+    func requestKeyframe() { queue.async { self.needsKeyframe = true } }
+    // `targetDisplayID` nil captures the main display. A virtual target may need a moment to report its mode.
+    @MainActor func start(request: QualityRequest? = nil, targetDisplayID: CGDirectDisplayID? = nil, isVirtual: Bool = false, fallbackPixelSize: (Int, Int)? = nil) async throws -> EffectiveQuality {
         guard !stopped else { throw WireError.invalid }
         let display: SCDisplay
         if let targetDisplayID {
@@ -152,16 +157,18 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         guard !stopped else { throw WireError.invalid }
         rect = CGDisplayBounds(display.displayID)
+        displayID = display.displayID
         let mode = CGDisplayCopyDisplayMode(display.displayID)
         let modeW = mode?.pixelWidth ?? 0, modeH = mode?.pixelHeight ?? 0
         let width = Double(modeW > 0 ? modeW : (fallbackPixelSize?.0 ?? display.width))
         let height = Double(modeH > 0 ? modeH : (fallbackPixelSize?.1 ?? display.height))
-        let targetQuality = request.map { EffectiveQuality.resolve($0, hostHEVCEncode: VideoEncoder.supportsHardwareHEVC, virtualDisplay: targetDisplayID != nil) } ?? .legacyDefaults
+        let targetQuality = request.map { EffectiveQuality.resolve($0, hostHEVCEncode: VideoEncoder.supportsHardwareHEVC, virtualDisplay: isVirtual) } ?? .legacyDefaults
         let bounds = request == nil ? (1920.0, 1200.0) : targetQuality.maxResolution.maxBounds
         let scaled = MaxResolutionOption.scaledSize(displayWidth: width, displayHeight: height, bounds: bounds)
+        outputSize = scaled
 
         func startWith(_ quality: EffectiveQuality) async throws -> EffectiveQuality {
-            let encoder = try VideoEncoder(width: scaled.width, height: scaled.height, quality: quality) { [weak self] message in self?.deliver(message) }
+            let encoder = try VideoEncoder(width: scaled.width, height: scaled.height, quality: quality, stream: streamIndex) { [weak self] message in self?.deliver(message) }
             let actual = encoder.effectiveQuality
             let config = SCStreamConfiguration()
             config.width = scaled.width
@@ -218,7 +225,8 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
 final class InputInjector {
     var postEvent: (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) }
     private func post(_ event: CGEvent?) { if let event = event { postEvent(event) } }
-    var rect = CGRect.zero
+    // Host display bounds per viewer screen id. Each stream maps 0...1 into its own display.
+    var rects = [Int: CGRect]()
     var keys = Set<UInt16>()
     var buttons = Set<UInt16>()
     var modifiers = Set<UInt16>()
@@ -226,6 +234,9 @@ final class InputInjector {
     func apply(_ m: InputMessage) {
         guard m.valid else { return }
         if m.kind == .release { release(); return }
+        // Keys carry no point, but the shared guard below needs a valid rect. Pointer events need their own screen.
+        let isKey = m.kind == .keyDown || m.kind == .keyUp || m.kind == .flags
+        let rect = rects[m.screen ?? 0] ?? (isKey ? rects.values.first : nil) ?? .zero
         // Gesture streams left open by a disconnect are not ended synthetically.
         if m.kind == .gesture { post(gestureEvent(m, hostBuild: osBuild, rect: rect)); return }
         guard let point = normalizedPoint(x: m.x, y: m.y, rect: rect) else { return }

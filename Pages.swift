@@ -560,6 +560,7 @@ final class SettingsPage: NSObject {
     let resolutionPopup = NSPopUpButton()
     let fpsControl = NSSegmentedControl(labels: ["30 fps", "60 fps"], trackingMode: .selectOne, target: nil, action: nil)
     let virtualDisplaySwitch = NSSwitch()
+    let edgeReturnSwitch = NSSwitch()
     let qualityNote = label("최근 연결: 없음", 11, .regular, Palette.secondary)
     private var lastEffective: String?
     private var isConnected = false
@@ -599,17 +600,18 @@ final class SettingsPage: NSObject {
         codecPopup.addItems(withTitles: ["자동", "H.264", "HEVC (H.265)"])
         bitratePopup.addItems(withTitles: ["자동 (8 Mbps)", "5 Mbps", "10 Mbps", "20 Mbps", "35 Mbps", "50 Mbps"])
         resolutionPopup.addItems(withTitles: ["1080p (1920×1080)", "1440p (2560×1440)", "원본 (최대 3840×2400)"])
-        for c in [codecPopup, bitratePopup, resolutionPopup, virtualDisplaySwitch] as [NSControl] { c.target = self; c.action = #selector(qualityChanged) }
+        for c in [codecPopup, bitratePopup, resolutionPopup, virtualDisplaySwitch, edgeReturnSwitch] as [NSControl] { c.target = self; c.action = #selector(qualityChanged) }
         for c in [chromaControl, fpsControl] as [NSSegmentedControl] { c.target = self; c.action = #selector(qualityChanged) }
         syncQualityControls()
         qualityNote.lineBreakMode = .byWordWrapping; qualityNote.maximumNumberOfLines = 0
         let qualityRows = [
             settingRow("코덱", "자동은 양쪽 Mac이 하드웨어 HEVC를 지원할 때 HEVC를 사용합니다.", [codecPopup]),
             settingRow("색상", "선명한 글자(4:4:4)는 HEVC에서만 활성화되며, 미지원 시 4:2:0으로 적용됩니다.", [chromaControl]),
-            settingRow("비트레이트", "최대 대역폭은 평균의 1.5배로 제한합니다.", [bitratePopup]),
+            settingRow("비트레이트", "화면마다 적용합니다. 최대 대역폭은 평균의 1.5배로 제한합니다.", [bitratePopup]),
             settingRow("최대 해상도", "호스트 기본 해상도를 짝수 크기와 비율을 유지해 축소합니다.", [resolutionPopup]),
             settingRow("프레임", "60 fps는 화면이 부드럽지만 더 많은 대역폭을 사용합니다.", [fpsControl]),
-            settingRow("접속 시 가상 디스플레이 사용", "상대 Mac에 이 Mac 크기의 가상 화면을 만들어 그 화면을 보여 줍니다. 원래 화면은 그대로 둡니다.", [virtualDisplaySwitch]),
+            settingRow("화면이 하나일 때 가상 화면 사용", "이 Mac의 화면이 하나일 때 상대 Mac에 이 화면 크기의 가상 화면을 만들어 보여 줍니다. 끄면 상대 Mac의 기본 화면을 보여 줍니다.", [virtualDisplaySwitch]),
+            settingRow("가장자리로 이 Mac에 돌아오기", "원격 화면의 왼쪽이나 오른쪽 바깥 끝으로 마우스를 0.25초 밀면 이 Mac으로 돌아오고, 다시 밀면 원격으로 들어갑니다.", [edgeReturnSwitch]),
         ]
         let info = Bundle.main.infoDictionary
         let version = label("Pulsar \(info?["CFBundleShortVersionString"] as? String ?? "") (\(info?["CFBundleVersion"] as? String ?? ""))", 11, .regular, Palette.secondary)
@@ -641,7 +643,8 @@ final class SettingsPage: NSObject {
         bitratePopup.selectItem(at: BitrateOption.allCases.firstIndex(of: prefs.bitrate) ?? 0)
         resolutionPopup.selectItem(at: MaxResolutionOption.allCases.firstIndex(of: prefs.maxResolution) ?? 0)
         fpsControl.selectedSegment = FPSOption.allCases.firstIndex(of: prefs.fps) ?? 0
-        virtualDisplaySwitch.state = prefs.useVirtualDisplay ? .on : .off
+        virtualDisplaySwitch.state = prefs.singleScreenVirtual ? .on : .off
+        edgeReturnSwitch.state = prefs.edgeReturn ? .on : .off
         updateChromaState(savedChroma: prefs.chroma)
     }
     private func updateChromaState(savedChroma: ChromaOption) {
@@ -656,7 +659,8 @@ final class SettingsPage: NSObject {
         prefs.bitrate = BitrateOption.allCases[max(0, bitratePopup.indexOfSelectedItem)]
         prefs.maxResolution = MaxResolutionOption.allCases[max(0, resolutionPopup.indexOfSelectedItem)]
         prefs.fps = FPSOption.allCases[max(0, fpsControl.selectedSegment)]
-        prefs.useVirtualDisplay = virtualDisplaySwitch.state == .on
+        prefs.singleScreenVirtual = virtualDisplaySwitch.state == .on
+        prefs.edgeReturn = edgeReturnSwitch.state == .on
         if sender === chromaControl {
             prefs.chroma = chromaControl.selectedSegment == 1 ? .yuv444 : .yuv420
         }
@@ -691,6 +695,9 @@ final class SessionView: NSView {
     let metrics = label("", 13, .regular, NSColor(white: 1, alpha: 0.72))
     let fullScreen = NSButton(title: "전체 화면", target: nil, action: nil)
     let leave = NSButton(title: "연결 종료", target: nil, action: nil)
+    let monitors = NSPopUpButton(frame: .zero, pullsDown: true)
+    // Screen windows route the pointer centrally, so their views must not generate their own moves.
+    var tracksMouse = true
     var pinned = false
     var reconnectShown = false
     var shown = false
@@ -704,7 +711,8 @@ final class SessionView: NSView {
         metrics.font = .monospacedDigitSystemFont(ofSize: 13, weight: .regular)
         leave.bezelColor = Palette.red
         board.appearance = NSAppearance(named: .darkAqua)
-        let row = hstack([dot, peer, quality, metrics, spacer(), fullScreen, leave], 10)
+        monitors.isHidden = true
+        let row = hstack([dot, peer, quality, metrics, spacer(), monitors, fullScreen, leave], 10)
         row.setCustomSpacing(16, after: metrics)
         for v in [viewer, board] as [NSView] { v.translatesAutoresizingMaskIntoConstraints = false; addSubview(v) }
         row.translatesAutoresizingMaskIntoConstraints = false; board.addSubview(row)
@@ -722,15 +730,29 @@ final class SessionView: NSView {
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         trackingAreas.forEach(removeTrackingArea)
+        guard tracksMouse else { return }
         addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self, userInfo: nil))
     }
+    override func mouseMoved(with event: NSEvent) { pointer(atY: viewer.convert(event.locationInWindow, from: nil).y) }
+    override func mouseExited(with event: NSEvent) { pointerLeft() }
     // The board appears when the pointer touches the top 6 pt of the remote screen and leaves once it moves below the board.
-    override func mouseMoved(with event: NSEvent) {
-        let y = viewer.convert(event.locationInWindow, from: nil).y
+    func pointer(atY y: CGFloat) {
         pointerNearTop = y <= 44
         if y <= 6 { setBoard(true) } else if !pointerNearTop { hideIfIdle() }
     }
-    override func mouseExited(with event: NSEvent) { pointerNearTop = false; hideIfIdle() }
+    func pointerLeft() { pointerNearTop = false; hideIfIdle() }
+    func boardContains(windowPoint p: NSPoint) -> Bool { shown && !board.isHidden && board.frame.contains(convert(p, from: nil)) }
+    // Pull-down: item 0 is the title. Represented objects carry the ScreenSource wire value.
+    func setMonitors(_ choices: [(title: String, wire: String)], current: String?) {
+        monitors.removeAllItems()
+        monitors.addItem(withTitle: "다른 모니터 보기")
+        for c in choices {
+            monitors.addItem(withTitle: c.title)
+            monitors.lastItem?.representedObject = c.wire
+            monitors.lastItem?.state = c.wire == current ? .on : .off
+        }
+        monitors.isHidden = choices.isEmpty
+    }
     func hideIfIdle() { if shown && !pinned && !reconnectShown && Date() >= holdUntil && !pointerNearTop { setBoard(false) } }
     // The overlay shortcut pins the board until pressed again.
     func togglePinned() { pinned.toggle(); if pinned { setBoard(true) } else { hideIfIdle() } }

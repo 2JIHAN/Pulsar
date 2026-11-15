@@ -63,9 +63,12 @@ struct InputMessage: Codable {
     // Gesture only: the viewer's serialized CGEvent and the OS build that produced it.
     var data: Data? = nil
     var build: String? = nil
+    // Client screen whose stream the coordinates belong to. 0.8 viewers omit it and mean stream 0.
+    var screen: Int? = nil
     static let gestureDataLimit = 64 * 1024
     var valid: Bool {
-        guard x.isFinite && y.isFinite && (0...1).contains(x) && (0...1).contains(y) && dx.isFinite && dy.isFinite && abs(dx) <= 1000 && abs(dy) <= 1000 && code <= 255 else { return false }
+        guard x.isFinite && y.isFinite && (0...1).contains(x) && (0...1).contains(y) && dx.isFinite && dy.isFinite && abs(dx) <= 1000 && abs(dy) <= 1000 && code <= 255,
+              screen.map({ (0..<maxScreenStreams).contains($0) }) ?? true else { return false }
         guard kind == .gesture else { return data == nil && build == nil }
         guard let data, let build else { return false }
         return !data.isEmpty && data.count <= Self.gestureDataLimit && !build.isEmpty && build.count <= 32
@@ -486,14 +489,17 @@ struct StreamQualityPreferences: Equatable {
     var bitrate: BitrateOption = .auto
     var maxResolution: MaxResolutionOption = .p1080
     var fps: FPSOption = .fps30
-    var useVirtualDisplay: Bool = true
+    var singleScreenVirtual: Bool = false
+    var edgeReturn: Bool = true
 
     private static let codecKey = "quality.codec"
     private static let chromaKey = "quality.chroma"
     private static let bitrateKey = "quality.bitrate"
     private static let resolutionKey = "quality.maxResolution"
     private static let fpsKey = "quality.fps"
-    private static let virtualDisplayKey = "quality.useVirtualDisplay"
+    // A new key: 0.8 saved the old default (on) whenever any quality control changed.
+    private static let virtualDisplayKey = "quality.singleScreenVirtual"
+    private static let edgeReturnKey = "session.edgeReturn"
 
     static func load(_ d: UserDefaults = .standard) -> StreamQualityPreferences {
         var p = StreamQualityPreferences()
@@ -502,7 +508,8 @@ struct StreamQualityPreferences: Equatable {
         if d.object(forKey: bitrateKey) != nil, let v = BitrateOption(rawValue: d.integer(forKey: bitrateKey)) { p.bitrate = v }
         if let raw = d.string(forKey: resolutionKey), let v = MaxResolutionOption(rawValue: raw) { p.maxResolution = v }
         if d.object(forKey: fpsKey) != nil, let v = FPSOption(rawValue: d.integer(forKey: fpsKey)) { p.fps = v }
-        if d.object(forKey: virtualDisplayKey) != nil { p.useVirtualDisplay = d.bool(forKey: virtualDisplayKey) }
+        if d.object(forKey: virtualDisplayKey) != nil { p.singleScreenVirtual = d.bool(forKey: virtualDisplayKey) }
+        if d.object(forKey: edgeReturnKey) != nil { p.edgeReturn = d.bool(forKey: edgeReturnKey) }
         return p
     }
     func save(_ d: UserDefaults = .standard) {
@@ -511,16 +518,212 @@ struct StreamQualityPreferences: Equatable {
         d.set(bitrate.rawValue, forKey: Self.bitrateKey)
         d.set(maxResolution.rawValue, forKey: Self.resolutionKey)
         d.set(fps.rawValue, forKey: Self.fpsKey)
-        d.set(useVirtualDisplay, forKey: Self.virtualDisplayKey)
+        d.set(singleScreenVirtual, forKey: Self.virtualDisplayKey)
+        d.set(edgeReturn, forKey: Self.edgeReturnKey)
     }
-    func request(hevcDecode: Bool, virtualDisplay: VirtualDisplayRequest? = nil) -> QualityRequest {
-        QualityRequest(codec: codec, chroma: codec == .h264 ? .yuv420 : chroma, bitrate: bitrate, maxResolution: maxResolution, fps: fps, hevcDecode: hevcDecode, virtualDisplay: virtualDisplay)
+    func request(hevcDecode: Bool, virtualDisplay: VirtualDisplayRequest? = nil, screens: [ClientScreen]? = nil) -> QualityRequest {
+        QualityRequest(codec: codec, chroma: codec == .h264 ? .yuv420 : chroma, bitrate: bitrate, maxResolution: maxResolution, fps: fps, hevcDecode: hevcDecode, virtualDisplay: virtualDisplay, screens: screens)
+    }
+}
+
+let maxScreenStreams = 4
+
+// One viewer screen as the viewer sees it. Frames are in global Cocoa points.
+struct ClientScreen: Codable, Equatable {
+    var id: Int
+    var isMain: Bool
+    var x: Double, y: Double, width: Double, height: Double
+    var pixelWidth: Int, pixelHeight: Int
+    var scale: Int
+    // nil follows the host's mapping rule; "virtual" or a host display id is a remembered choice.
+    var show: String? = nil
+    var frame: CGRect { CGRect(x: x, y: y, width: width, height: height) }
+    var valid: Bool {
+        [x, y, width, height].allSatisfy(\.isFinite) && abs(x) <= 100_000 && abs(y) <= 100_000
+            && (100.0...20_000).contains(width) && (100.0...20_000).contains(height)
+            && (1...16_384).contains(pixelWidth) && (1...16_384).contains(pixelHeight) && (scale == 1 || scale == 2)
+            && (0..<maxScreenStreams).contains(id) && (show.map { !$0.isEmpty && $0.count <= 64 } ?? true)
+    }
+    static func validList(_ list: [ClientScreen]) -> Bool {
+        (1...maxScreenStreams).contains(list.count) && list.allSatisfy(\.valid)
+            && list.map(\.id).sorted() == Array(0..<list.count) && list.filter(\.isMain).count == 1
+    }
+    // NSScreen.screens[0] holds the menu bar, like the host's CGMainDisplayID.
+    static func list(_ screens: [NSScreen]) -> [ClientScreen] {
+        screens.prefix(maxScreenStreams).enumerated().map { i, s in
+            let scale = s.backingScaleFactor >= 2 ? 2 : 1, f = s.frame
+            return ClientScreen(id: i, isMain: i == 0, x: f.minX, y: f.minY, width: f.width, height: f.height,
+                                pixelWidth: Int((f.width * CGFloat(scale)).rounded()), pixelHeight: Int((f.height * CGFloat(scale)).rounded()), scale: scale)
+        }
+    }
+}
+
+enum ScreenSource: Equatable {
+    case physical(String), virtual
+    static let virtualWire = "virtual"
+    init?(wire: String) {
+        guard !wire.isEmpty, wire.count <= 64 else { return nil }
+        self = wire == Self.virtualWire ? .virtual : .physical(wire)
+    }
+    var wire: String { if case .physical(let id) = self { return id }; return Self.virtualWire }
+}
+
+struct HostDisplay: Equatable {
+    var cgID: CGDirectDisplayID
+    var id: String
+    var name: String
+    var isMain: Bool
+    var bounds: CGRect
+    var vendor: UInt32
+    var mirrorOf: CGDirectDisplayID
+    var active = true
+    static let pulsarVendor: UInt32 = 0x5055, thunderControlVendor: UInt32 = 505
+    // A mirror shows another display's pixels, and another remote tool's virtual screen is nobody's monitor.
+    static func streamable(_ all: [HostDisplay]) -> [HostDisplay] {
+        all.filter { $0.mirrorOf == 0 && $0.active && $0.vendor != pulsarVendor && $0.vendor != thunderControlVendor }
+    }
+    static func online() -> [HostDisplay] {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 32); var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(32, &ids, &count) == .success else { return [] }
+        let names = Dictionary(NSScreen.screens.compactMap { s in
+            (s.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber).map { ($0.uint32Value, s.localizedName) }
+        }, uniquingKeysWith: { a, _ in a })
+        return ids.prefix(Int(count)).enumerated().map { i, d in
+            // The ColorSync UUID survives reconnects and reboots, unlike the CGDirectDisplayID.
+            let uuid = CGDisplayCreateUUIDFromDisplayID(d).map { CFUUIDCreateString(nil, $0.takeRetainedValue()) as String }
+            return HostDisplay(cgID: d, id: uuid ?? "\(CGDisplayVendorNumber(d))-\(CGDisplayModelNumber(d))-\(CGDisplaySerialNumber(d))-\(d)",
+                               name: names[d] ?? "디스플레이 \(i + 1)", isMain: CGDisplayIsMain(d) != 0, bounds: CGDisplayBounds(d),
+                               vendor: CGDisplayVendorNumber(d), mirrorOf: CGDisplayMirrorsDisplay(d), active: CGDisplayIsActive(d) != 0)
+        }
+    }
+}
+
+struct ScreenAssignment: Equatable {
+    var sources: [Int: ScreenSource]
+    var unused: [String]
+}
+// Remembered choices first, then host main -> client main, then the closest horizontal offsets from main.
+// `host` must already be streamable displays.
+func mapScreens(client: [ClientScreen], host: [HostDisplay], singleScreenVirtual: Bool) -> ScreenAssignment {
+    var sources = [Int: ScreenSource](), used = Set<String>()
+    let known = Set(host.map(\.id))
+    for c in client.sorted(by: { $0.id < $1.id }) {
+        guard let wire = c.show, let s = ScreenSource(wire: wire) else { continue }
+        switch s {
+        case .virtual: sources[c.id] = .virtual
+        case .physical(let id) where known.contains(id) && !used.contains(id): sources[c.id] = s; used.insert(id)
+        case .physical: break
+        }
+    }
+    let hostMain = host.first(where: \.isMain) ?? host.first
+    if client.count == 1 {
+        if sources[client[0].id] == nil {
+            sources[client[0].id] = singleScreenVirtual ? .virtual : hostMain.map { .physical($0.id) } ?? .virtual
+        }
+        return ScreenAssignment(sources: sources, unused: host.map(\.id).filter { !used.contains($0) && sources[client[0].id] != .physical($0) })
+    }
+    guard let clientMain = client.first(where: \.isMain) else { return ScreenAssignment(sources: sources, unused: []) }
+    if let hm = hostMain, sources[clientMain.id] == nil, !used.contains(hm.id) { sources[clientMain.id] = .physical(hm.id); used.insert(hm.id) }
+    if let hm = hostMain {
+        func offset(_ r: CGRect, from main: CGRect) -> Double { Double((r.minX - main.minX) / max(1, main.width)) }
+        var pairs = [(distance: Double, client: Int, host: Int)]()
+        for c in client where sources[c.id] == nil {
+            for (hi, h) in host.enumerated() where !used.contains(h.id) {
+                pairs.append((abs(offset(c.frame, from: clientMain.frame) - offset(h.bounds, from: hm.bounds)), c.id, hi))
+            }
+        }
+        for p in pairs.sorted(by: { ($0.distance, $0.client, $0.host) < ($1.distance, $1.client, $1.host) })
+        where sources[p.client] == nil && !used.contains(host[p.host].id) {
+            sources[p.client] = .physical(host[p.host].id); used.insert(host[p.host].id)
+        }
+    }
+    for c in client where sources[c.id] == nil { sources[c.id] = .virtual }
+    return ScreenAssignment(sources: sources, unused: host.map(\.id).filter { !used.contains($0) })
+}
+
+// Host -> viewer: what each viewer screen shows, and every host display it can switch to.
+struct ScreenMap: Codable, Equatable {
+    static let messageType: UInt8 = 7
+    static let maxWireBytes = 8192
+    enum Kind: String, Codable { case physical, virtual }
+    struct Entry: Codable, Equatable {
+        var clientScreenId: Int
+        var kind: Kind
+        var hostDisplayName: String
+        var hostDisplayId: String
+        var pixelWidth: Int
+        var pixelHeight: Int
+    }
+    struct Display: Codable, Equatable { var id: String; var name: String }
+    var screens: [Entry]
+    var switchable: [Display]
+    func wireMessage() -> Data { Data([Self.messageType]) + ((try? JSONEncoder().encode(self)) ?? Data()) }
+    static func decodeWire(_ data: Data) -> ScreenMap? {
+        guard data.first == messageType, data.count > 1, data.count <= maxWireBytes,
+              let m = try? JSONDecoder().decode(ScreenMap.self, from: data.dropFirst()),
+              (1...maxScreenStreams).contains(m.screens.count), m.switchable.count <= 16,
+              Set(m.screens.map(\.clientScreenId)).count == m.screens.count else { return nil }
+        func text(_ s: String, _ limit: Int) -> Bool { !s.isEmpty && s.count <= limit }
+        for e in m.screens {
+            guard (0..<maxScreenStreams).contains(e.clientScreenId), text(e.hostDisplayName, 128), text(e.hostDisplayId, 64),
+                  (e.kind == .virtual) == (e.hostDisplayId == ScreenSource.virtualWire),
+                  (2...16_384).contains(e.pixelWidth), (2...16_384).contains(e.pixelHeight) else { return nil }
+        }
+        guard m.switchable.allSatisfy({ text($0.id, 64) && text($0.name, 128) && $0.id != ScreenSource.virtualWire }) else { return nil }
+        return m
+    }
+}
+// Viewer -> host: show another source on one viewer screen.
+struct ScreenSwitch: Codable, Equatable {
+    static let messageType: UInt8 = 10
+    var clientScreenId: Int
+    var show: String
+    func wireMessage() -> Data { Data([Self.messageType]) + ((try? JSONEncoder().encode(self)) ?? Data()) }
+    static func decodeWire(_ data: Data) -> ScreenSwitch? {
+        guard data.first == messageType, data.count > 1, data.count <= 512,
+              let s = try? JSONDecoder().decode(ScreenSwitch.self, from: data.dropFirst()),
+              (0..<maxScreenStreams).contains(s.clientScreenId), ScreenSource(wire: s.show) != nil else { return nil }
+        return s
+    }
+}
+// Viewer -> host: [11][stream]. Sent when a hidden screen becomes visible again.
+enum KeyframeRequest {
+    static let messageType: UInt8 = 11
+    static func wire(_ stream: Int) -> Data { Data([messageType, UInt8(stream)]) }
+    static func decode(_ data: Data) -> Int? {
+        guard data.count == 2, data.first == messageType, Int(data[data.startIndex + 1]) < maxScreenStreams else { return nil }
+        return Int(data[data.startIndex + 1])
+    }
+}
+
+// Viewer screen layout -> remembered choice per host, keyed by sizes and offsets from the main screen.
+enum ScreenLayoutMemory {
+    static func entry(_ s: ClientScreen, main: ClientScreen) -> String {
+        "\(Int(s.width))x\(Int(s.height))@\(Int(s.x - main.x)),\(Int(s.y - main.y))"
+    }
+    static func signature(_ screens: [ClientScreen]) -> String {
+        guard let main = screens.first(where: \.isMain) else { return "" }
+        return screens.map { entry($0, main: main) }.sorted().joined(separator: ";")
+    }
+    static func key(host: String, screens: [ClientScreen]) -> String { "screenLayout.\(host)|\(signature(screens))" }
+    static func load(host: String, screens: [ClientScreen], _ d: UserDefaults = .standard) -> [Int: String] {
+        guard let main = screens.first(where: \.isMain), let saved = d.dictionary(forKey: key(host: host, screens: screens)) as? [String: String] else { return [:] }
+        var out = [Int: String]()
+        for s in screens { if let v = saved[entry(s, main: main)], ScreenSource(wire: v) != nil { out[s.id] = v } }
+        return out
+    }
+    static func save(host: String, screens: [ClientScreen], choices: [Int: String], _ d: UserDefaults = .standard) {
+        guard let main = screens.first(where: \.isMain) else { return }
+        var out = [String: String]()
+        for s in screens { if let v = choices[s.id] { out[entry(s, main: main)] = v } }
+        d.set(out, forKey: key(host: host, screens: screens))
     }
 }
 
 struct QualityRequest: Codable, Equatable {
     static let messageType: UInt8 = 5
-    static let maxWireBytes = 512
+    // 0.8 hosts reject requests over 512 bytes, which more than two screens can exceed.
+    static let maxWireBytes = 2048
     var codec: CodecPreference
     var chroma: ChromaOption
     var bitrate: BitrateOption
@@ -528,6 +731,7 @@ struct QualityRequest: Codable, Equatable {
     var fps: FPSOption
     var hevcDecode: Bool
     var virtualDisplay: VirtualDisplayRequest? = nil
+    var screens: [ClientScreen]? = nil
 
     func wireMessage() -> Data {
         let json = (try? JSONEncoder().encode(self)) ?? Data()
@@ -537,6 +741,7 @@ struct QualityRequest: Codable, Equatable {
         guard data.first == messageType, data.count > 1, data.count <= maxWireBytes,
               let req = try? JSONDecoder().decode(QualityRequest.self, from: data.dropFirst()) else { return nil }
         if let vd = req.virtualDisplay, !vd.valid { return nil }
+        if let s = req.screens, !ClientScreen.validList(s) { return nil }
         return req
     }
 }
@@ -605,23 +810,29 @@ struct EffectiveQuality: Codable, Equatable {
 
 // Message type 4: [4][flags: bit 0 = keyframe, bit 1 = HEVC][keyframe only: UInt16 BE length + parameter sets (H.264: SPS,PPS; HEVC: VPS,SPS,PPS)]
 // [one access unit as AVCC/HVCC NAL units, each prefixed by a UInt32 BE length].
+// Message type 8 is the same with a stream byte (viewer screen id, 0...3) before the flags; only sent to
+// viewers that listed their screens, so 0.8 viewers keep receiving type 4.
 struct VideoFrame: Equatable {
     var codec: ResolvedCodec = .h264
     var keyframe: Bool
     var parameterSets: [Data]
     var avcc: Data
+    var stream: UInt8? = nil
     var message: Data {
         let flags: UInt8 = (keyframe ? 1 : 0) | (codec == .hevc ? 2 : 0)
-        var data = Data([4, flags])
+        var data = stream.map { Data([8, $0, flags]) } ?? Data([4, flags])
         for p in parameterSets { data += [UInt8(p.count >> 8), UInt8(p.count & 0xff)] + p }
         return data + avcc
     }
     static func parse(_ data: Data) throws -> VideoFrame {
         let b = [UInt8](data)
-        guard b.count >= 7, b.count <= PacketParser.limit, b[0] == 4, b[1] <= 3 else { throw WireError.invalid }
-        let keyframe = (b[1] & 1) != 0
-        let codec: ResolvedCodec = (b[1] & 2) != 0 ? .hevc : .h264
-        var i = 2
+        guard b.count >= 7, b.count <= PacketParser.limit, b[0] == 4 || b[0] == 8 else { throw WireError.invalid }
+        let stream: UInt8? = b[0] == 8 ? b[1] : nil
+        let f = stream == nil ? 1 : 2
+        guard b.count >= f + 6, (stream ?? 0) < UInt8(maxScreenStreams), b[f] <= 3 else { throw WireError.invalid }
+        let keyframe = (b[f] & 1) != 0
+        let codec: ResolvedCodec = (b[f] & 2) != 0 ? .hevc : .h264
+        var i = f + 1
         var parameterSets = [Data]()
         if keyframe {
             let expectedTypes: [UInt8] = codec == .hevc ? [32, 33, 34] : [7, 8]
@@ -645,11 +856,11 @@ struct VideoFrame: Equatable {
             guard n > 0, n <= b.count - i, units <= 256 else { throw WireError.invalid }
             i += n
         }
-        return VideoFrame(codec: codec, keyframe: keyframe, parameterSets: parameterSets, avcc: Data(b[start...]))
+        return VideoFrame(codec: codec, keyframe: keyframe, parameterSets: parameterSets, avcc: Data(b[start...]), stream: stream)
     }
 }
 // Encoder output -> wire message. Returns nil for anything the viewer parser would reject.
-func videoMessage(_ sample: CMSampleBuffer, codec: ResolvedCodec = .h264) -> Data? {
+func videoMessage(_ sample: CMSampleBuffer, codec: ResolvedCodec = .h264, stream: UInt8? = nil) -> Data? {
     guard let block = CMSampleBufferGetDataBuffer(sample), let format = CMSampleBufferGetFormatDescription(sample) else { return nil }
     let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[CFString: Any]]
     let keyframe = attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool != true
@@ -677,7 +888,7 @@ func videoMessage(_ sample: CMSampleBuffer, codec: ResolvedCodec = .h264) -> Dat
     guard length > 0, length <= PacketParser.limit else { return nil }
     var avcc = Data(count: length)
     guard avcc.withUnsafeMutableBytes({ CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!) }) == noErr else { return nil }
-    let message = VideoFrame(codec: codec, keyframe: keyframe, parameterSets: parameterSets, avcc: avcc).message
+    let message = VideoFrame(codec: codec, keyframe: keyframe, parameterSets: parameterSets, avcc: avcc, stream: stream).message
     return (try? VideoFrame.parse(message)) == nil ? nil : message
 }
 // Validates dimensions from the SPS before anything is decoded.

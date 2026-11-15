@@ -43,7 +43,8 @@ func runSelfTests() {
         print("PASS viewer builds valid input messages from real mouse and scroll NSEvents")
         try videoTests()
         qualityTests()
-        let injector = InputInjector(); injector.rect = CGRect(x: 0, y: 0, width: 1440, height: 900)
+        try multiScreenTests()
+        let injector = InputInjector(); injector.rects = [0: CGRect(x: 0, y: 0, width: 1440, height: 900)]
         var posted = 0; injector.postEvent = { _ in posted += 1 }
         injector.release(); precondition(posted == 0)
         injector.apply(InputMessage(kind: .flags, code: 55, flags: CGEventFlags.maskCommand.rawValue))
@@ -138,10 +139,10 @@ func testPixelBuffer(width: Int, height: Int, shade: Int, format: OSType = kCVPi
     CVPixelBufferUnlockBaseAddress(pixel, [])
     return pixel
 }
-func encodeTestFrames(width: Int, height: Int, keyframes: Set<Int>, count: Int, quality: EffectiveQuality = .legacyDefaults) throws -> [Data] {
+func encodeTestFrames(width: Int, height: Int, keyframes: Set<Int>, count: Int, quality: EffectiveQuality = .legacyDefaults, stream: UInt8? = nil) throws -> [Data] {
     var messages = [Data?]()
     let lock = NSLock(), done = DispatchSemaphore(value: 0)
-    let encoder = try VideoEncoder(width: width, height: height, quality: quality) { m in lock.lock(); messages.append(m); lock.unlock(); done.signal() }
+    let encoder = try VideoEncoder(width: width, height: height, quality: quality, stream: stream) { m in lock.lock(); messages.append(m); lock.unlock(); done.signal() }
     let fmt = encoder.effectiveQuality.chroma == .yuv444 ? kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
     for i in 0..<count {
         precondition(encoder.encode(testPixelBuffer(width: width, height: height, shade: i, format: fmt), time: CMTime(value: Int64(i), timescale: Int32(quality.fps.rawValue)), keyframe: keyframes.contains(i)))
@@ -191,6 +192,20 @@ func videoTests() throws {
     for (i, message) in bad.enumerated() where (try? VideoFrame.parse(message)) != nil { print("FAIL malformed video message \(i) accepted"); exit(1) }
     precondition((try? VideoFrame.parse(Data([4, 0] + Array(repeating: unit, count: 256).joined()))) != nil)
     print("PASS oversized H.264 dimensions (>3840x2400) and \(bad.count) malformed video messages rejected")
+    var streamedKey = frames[0]; streamedKey.stream = 2
+    let streamedWire = streamedKey.message
+    precondition(streamedWire.prefix(2) == Data([8, 2]) && (try? VideoFrame.parse(streamedWire)) == streamedKey && (try? VideoFrame.parse(messages[1]))?.stream == nil)
+    let encodedStream = try encodeTestFrames(width: 640, height: 480, keyframes: [0], count: 2, stream: 3)
+    precondition(encodedStream.allSatisfy { $0.first == 8 && (try? VideoFrame.parse($0))?.stream == 3 })
+    var streamedDelta = frames[1]; streamedDelta.stream = 1
+    let deltaWire = streamedDelta.message
+    let badStream: [Data] = [
+        Data([8, 4]) + deltaWire.dropFirst(2), Data([8, 255]) + deltaWire.dropFirst(2), Data([8, 1, 4]) + deltaWire.dropFirst(3),
+        Data([8, 1]), Data([8, 1, 0]), Data([8, 1, 0, 0, 0, 0, 0x41]), Data(streamedWire.dropLast()), Data(deltaWire + [0]),
+        Data([8, 1, 1, 0, 0]) + key.avcc,
+    ]
+    for (i, message) in badStream.enumerated() where (try? VideoFrame.parse(message)) != nil { print("FAIL malformed streamed video message \(i) accepted"); exit(1) }
+    print("PASS video stream byte: type 8 [stream][flags] roundtrip, encoder writes stream 3, type 4 stays stream-less for 0.8 viewers, \(badStream.count) malformed streamed messages rejected")
 
     let enc60 = try VideoEncoder(width: 1280, height: 720, quality: EffectiveQuality(codec: .h264, chroma: .yuv420, bitrateMbps: 20, maxResolution: .p1440, fps: .fps60)) { _ in }
     precondition(enc60.effectiveQuality.fps == .fps60 && enc60.effectiveQuality.bitrateMbps == 20)
@@ -282,7 +297,7 @@ func qualityTests() {
     precondition(EffectiveQuality.decodeWire(legacyEffWire) == EffectiveQuality(codec: .hevc, chroma: .yuv420, bitrateMbps: 20, maxResolution: .p1440, fps: .fps60, virtualDisplay: false))
     precondition(EffectiveQuality(codec: .hevc, chroma: .yuv420, bitrateMbps: 20, maxResolution: .p1440, fps: .fps60).summary == "HEVC · 1440p · 60fps · 20Mbps")
 
-    let pad = String(repeating: " ", count: 520)
+    let pad = String(repeating: " ", count: 2100)
     let badReqs: [Data] = [
         Data([6]) + wireReq.dropFirst(),
         Data([5]) + Data(#"{"codec":"vp9","chroma":"420","bitrate":0,"maxResolution":"1080p","fps":30,"hevcDecode":true}"#.utf8),
@@ -323,7 +338,7 @@ func qualityTests() {
     let suite = "com.tamcut.Pulsar.qualitytest.\(UUID().uuidString)", defaults = UserDefaults(suiteName: suite)!
     defer { defaults.removePersistentDomain(forName: suite) }
     precondition(StreamQualityPreferences.load(defaults) == StreamQualityPreferences())
-    let saved = StreamQualityPreferences(codec: .hevc, chroma: .yuv444, bitrate: .mbps35, maxResolution: .native, fps: .fps60, useVirtualDisplay: false)
+    let saved = StreamQualityPreferences(codec: .hevc, chroma: .yuv444, bitrate: .mbps35, maxResolution: .native, fps: .fps60, singleScreenVirtual: true, edgeReturn: false)
     saved.save(defaults)
     precondition(StreamQualityPreferences.load(defaults) == saved)
     precondition(StreamQualityPreferences(codec: .h264, chroma: .yuv444, bitrate: .auto, maxResolution: .p1080, fps: .fps30).request(hevcDecode: true).chroma == .yuv420)
@@ -445,7 +460,7 @@ func gestureTests(injector: InputInjector) throws {
     precondition(event.type.rawValue == 29 && event.getIntegerValueField(CGEventField(rawValue: 110)!) == 8
         && event.getIntegerValueField(CGEventField(rawValue: 132)!) == 2 && event.getDoubleValueField(CGEventField(rawValue: 113)!) == 0.25
         && event.location == CGPoint(x: 720, y: 450) && NativeGestureDescriptor.decode(event) == NativeGestureDescriptor(kind: .pinch, phase: .changed))
-    var posted = [CGEvent](); injector.postEvent = { posted.append($0) }; injector.rect = hostRect
+    var posted = [CGEvent](); injector.postEvent = { posted.append($0) }; injector.rects = [0: hostRect]
     injector.apply(m); precondition(posted.count == 1 && posted[0].type.rawValue == 29 && posted[0].location == CGPoint(x: 720, y: 450))
     var mismatch = m; mismatch.build = build + "x"
     injector.apply(mismatch); precondition(posted.count == 1 && gestureEvent(mismatch, hostBuild: build, rect: hostRect) == nil)
@@ -593,6 +608,9 @@ func hostingTests() {
 }
 
 func virtualDisplayTests() {
+    func require(_ condition: @autoclosure () -> Bool, _ message: String = "condition failed", line: UInt = #line) {
+        if !condition() { fputs("FAIL virtual display line \(line): \(message)\n", stderr); exit(1) }
+    }
     guard VirtualDisplay.isAvailable else {
         print("SKIP (virtual display API unavailable)")
         return
@@ -613,18 +631,37 @@ func virtualDisplayTests() {
     func onlineIDs() -> [CGDirectDisplayID] {
         var ids = [CGDirectDisplayID](repeating: 0, count: 32)
         var count: UInt32 = 0
-        precondition(CGGetOnlineDisplayList(32, &ids, &count) == .success)
+        require(CGGetOnlineDisplayList(32, &ids, &count) == .success)
         return Array(ids.prefix(Int(count)))
     }
 
-    let before = onlineIDs()
+    struct ExistingDisplay: Equatable {
+        let vendor: UInt32, model: UInt32, serial: UInt32
+        let active: Bool, mirror: CGDirectDisplayID, bounds: CGRect
+        let width: Int, height: Int, pixelWidth: Int, pixelHeight: Int
+        let hz: Double, flags: UInt32
+    }
+    func existingLayout(_ ids: [CGDirectDisplayID]) -> [CGDirectDisplayID: ExistingDisplay] {
+        Dictionary(uniqueKeysWithValues: ids.map { id in
+            guard let mode = CGDisplayCopyDisplayMode(id) else {
+                fputs("FAIL existing display mode unavailable\n", stderr); exit(1)
+            }
+            return (id, ExistingDisplay(vendor: CGDisplayVendorNumber(id), model: CGDisplayModelNumber(id),
+                serial: CGDisplaySerialNumber(id), active: CGDisplayIsActive(id) != 0,
+                mirror: CGDisplayMirrorsDisplay(id), bounds: CGDisplayBounds(id),
+                width: mode.width, height: mode.height, pixelWidth: mode.pixelWidth, pixelHeight: mode.pixelHeight,
+                hz: mode.refreshRate, flags: mode.ioFlags))
+        })
+    }
+    let before = onlineIDs(), priorMain = CGMainDisplayID()
+    let priorLayout = existingLayout(before)
     var vd: VirtualDisplay?
     autoreleasepool {
         vd = VirtualDisplay(width: 2880, height: 1800, scale: 2)
     }
-    precondition(vd != nil, "VirtualDisplay creation failed")
+    require(vd != nil, "VirtualDisplay creation failed")
     let vid = vd!.displayID
-    precondition(!before.contains(vid))
+    require(!before.contains(vid))
 
     var appeared = false
     for _ in 0..<30 {
@@ -635,7 +672,12 @@ func virtualDisplayTests() {
             break
         }
     }
-    precondition(appeared, "VirtualDisplay \(vid) did not appear with 2880x1800 pixel mode within 3s")
+    require(appeared, "VirtualDisplay \(vid) did not appear with 2880x1800 pixel mode within 3s")
+    require(CGMainDisplayID() == priorMain && existingLayout(before) == priorLayout, "VirtualDisplay changed an existing display")
+    require(CGDisplayIsActive(vid) != 0 && CGDisplayIsInMirrorSet(vid) == 0 && CGDisplayMirrorsDisplay(vid) == 0)
+    for id in before where CGDisplayIsActive(id) != 0 {
+        require(!CGDisplayBounds(vid).intersects(CGDisplayBounds(id)), "VirtualDisplay overlaps an existing screen")
+    }
 
     autoreleasepool {
         vd?.destroy()
@@ -649,7 +691,211 @@ func virtualDisplayTests() {
             break
         }
     }
-    precondition(disappeared, "VirtualDisplay \(vid) did not disappear within 3s after release")
-    precondition(onlineIDs() == before)
-    print("PASS virtual display created id=\(vid) at 2880x1800 and disappeared within 3s on release")
+    require(disappeared, "VirtualDisplay \(vid) did not disappear within 3s after release")
+    require(Set(onlineIDs()) == Set(before))
+    require(CGMainDisplayID() == priorMain && existingLayout(before) == priorLayout, "VirtualDisplay removal changed an existing display")
+    print("PASS virtual display preserves existing main/mirror/mode/origins; created id=\(vid) at 2880x1800 and disappeared within 3s on release")
+
+    let beforePair = Set(onlineIDs())
+    var pair = [VirtualDisplay]()
+    autoreleasepool {
+        pair = [VirtualDisplay(width: 1920, height: 1080, scale: 1), VirtualDisplay(width: 3024, height: 1964, scale: 2)].compactMap { $0 }
+    }
+    require(pair.count == 2, "two VirtualDisplays created (got \(pair.count))")
+    let pairIDs = Set(pair.map(\.displayID))
+    require(pairIDs.count == 2 && beforePair.isDisjoint(with: pairIDs))
+    var bothOnline = false
+    for _ in 0..<30 {
+        pump(0.1)
+        if pairIDs.isSubset(of: Set(onlineIDs())) { bothOnline = true; break }
+    }
+    require(bothOnline, "both virtual displays online within 3s")
+    require(HostDisplay.streamable(HostDisplay.online()).allSatisfy { !pairIDs.contains($0.cgID) }, "Pulsar virtual displays are never offered as host monitors")
+    autoreleasepool {
+        pair.forEach { $0.destroy() }
+        pair = []
+    }
+    var pairGone = false
+    for _ in 0..<30 {
+        pump(0.1)
+        if Set(onlineIDs()) == beforePair { pairGone = true; break }
+    }
+    require(pairGone, "both virtual displays gone within 3s; online \(onlineIDs()) vs \(beforePair.sorted())")
+    print("PASS two virtual displays \(pairIDs.sorted()) online together, excluded from host monitors, and both gone within 3s; display list back to \(beforePair.sorted())")
+}
+
+func multiScreenTests() throws {
+    func require(_ condition: @autoclosure () -> Bool, _ message: String, line: UInt = #line) {
+        if !condition() { fputs("FAIL multi-screen line \(line): \(message)\n", stderr); exit(1) }
+    }
+    func hd(_ id: String, main: Bool = false, x: CGFloat, w: CGFloat = 1920, vendor: UInt32 = 1552, mirror: CGDirectDisplayID = 0, active: Bool = true) -> HostDisplay {
+        HostDisplay(cgID: CGDirectDisplayID(abs(id.hashValue) % 1000 + 1), id: id, name: "Display \(id)", isMain: main,
+                    bounds: CGRect(x: x, y: 0, width: w, height: 1080), vendor: vendor, mirrorOf: mirror, active: active)
+    }
+    func cs(_ id: Int, main: Bool = false, x: Double, w: Double = 1512, h: Double = 982, show: String? = nil) -> ClientScreen {
+        ClientScreen(id: id, isMain: main, x: x, y: 0, width: w, height: h, pixelWidth: Int(w) * 2, pixelHeight: Int(h) * 2, scale: 2, show: show)
+    }
+    let A = hd("A", main: true, x: 0), B = hd("B", x: 1920), L = hd("L", x: -1920), R = hd("R", x: 1920)
+
+    var m = mapScreens(client: [cs(0, main: true, x: 0)], host: [A, B], singleScreenVirtual: false)
+    require(m == ScreenAssignment(sources: [0: .physical("A")], unused: ["B"]), "one viewer screen copies host main: \(m)")
+    m = mapScreens(client: [cs(0, main: true, x: 0)], host: [A, B], singleScreenVirtual: true)
+    require(m == ScreenAssignment(sources: [0: .virtual], unused: ["A", "B"]), "one viewer screen with the virtual setting: \(m)")
+    m = mapScreens(client: [cs(0, main: true, x: 0), cs(1, x: 1512)], host: [A], singleScreenVirtual: false)
+    require(m == ScreenAssignment(sources: [0: .physical("A"), 1: .virtual], unused: []), "host1/client2: \(m)")
+    m = mapScreens(client: [cs(0, main: true, x: 0), cs(1, x: 1512)], host: [hd("A", main: true, x: 0), hd("B", x: -1920)], singleScreenVirtual: false)
+    require(m == ScreenAssignment(sources: [0: .physical("A"), 1: .physical("B")], unused: []), "host2/client2 with mirrored arrangement: \(m)")
+    m = mapScreens(client: [cs(0, main: true, x: 0), cs(1, x: 1512)], host: [L, A, R], singleScreenVirtual: false)
+    require(m == ScreenAssignment(sources: [0: .physical("A"), 1: .physical("R")], unused: ["L"]), "host3/client2 keeps the left display switchable: \(m)")
+    m = mapScreens(client: [cs(0, main: true, x: 0), cs(1, x: -1920, w: 1920, h: 1080), cs(2, x: 1512)], host: [A, B], singleScreenVirtual: false)
+    require(m == ScreenAssignment(sources: [0: .physical("A"), 1: .virtual, 2: .physical("B")], unused: []), "host2/client3 mixed: \(m)")
+    m = mapScreens(client: [cs(0, main: true, x: 0, show: "B"), cs(1, x: 1512, show: "A")], host: [A, B], singleScreenVirtual: false)
+    require(m == ScreenAssignment(sources: [0: .physical("B"), 1: .physical("A")], unused: []), "remembered choices win: \(m)")
+    m = mapScreens(client: [cs(0, main: true, x: 0), cs(1, x: 1512, show: "GONE")], host: [A, B], singleScreenVirtual: false)
+    require(m == ScreenAssignment(sources: [0: .physical("A"), 1: .physical("B")], unused: []), "missing remembered display falls back to the rule: \(m)")
+    m = mapScreens(client: [cs(0, main: true, x: 0, show: "A"), cs(1, x: 1512, show: "A")], host: [A, B], singleScreenVirtual: false)
+    require(m == ScreenAssignment(sources: [0: .physical("A"), 1: .physical("B")], unused: []), "one physical display is not mapped twice: \(m)")
+    m = mapScreens(client: [cs(0, main: true, x: 0), cs(1, x: 1512)], host: [], singleScreenVirtual: false)
+    require(m == ScreenAssignment(sources: [0: .virtual, 1: .virtual], unused: []), "headless host gives virtual screens: \(m)")
+    print("PASS screen mapping: 1 screen copies host main (virtual when set), host1/client2, host2/client2 arrangement-independent, host3/client2 leaves 1 switchable, host2/client3 mixed, remembered/missing/duplicate choices, headless host")
+
+    let all = [A, B, hd("M", x: 1920, mirror: 1), hd("P", x: 3840, vendor: 0x5055), hd("T", x: 5760, vendor: 505), hd("S", x: 7680, active: false)]
+    require(HostDisplay.streamable(all).map(\.id) == ["A", "B"], "mirrors, Pulsar/ThunderControl virtual and inactive displays excluded")
+    let online = HostDisplay.online()
+    require(!online.isEmpty && online.allSatisfy { !$0.id.isEmpty && $0.id.count <= 64 } && Set(online.map(\.id)).count == online.count, "real displays get unique opaque ids")
+    print("PASS host display filter drops mirrors, Pulsar (0x5055) and ThunderControl (505) virtual displays; \(online.count) online displays have unique ids, \(HostDisplay.streamable(online).count) streamable")
+
+    let screens3 = [cs(0, main: true, x: 0), cs(1, x: -1920, w: 1920, h: 1080, show: "virtual"), cs(2, x: 1512, show: String(repeating: "F", count: 36))]
+    let req = QualityRequest(codec: .auto, chroma: .yuv420, bitrate: .mbps20, maxResolution: .p1440, fps: .fps60, hevcDecode: true, screens: screens3)
+    let reqWire = req.wireMessage()
+    require(reqWire.count <= QualityRequest.maxWireBytes && QualityRequest.decodeWire(reqWire) == req, "screens roundtrip (\(reqWire.count) bytes)")
+    let twoScreens = QualityRequest(codec: .auto, chroma: .yuv420, bitrate: .auto, maxResolution: .p1080, fps: .fps30, hevcDecode: true,
+                                    virtualDisplay: VirtualDisplayRequest(enabled: false, width: 3024, height: 1890, scale: 2), screens: [cs(0, main: true, x: 0), cs(1, x: 1512)])
+    require(twoScreens.wireMessage().count <= 512, "two screens fit a 0.8 host's 512-byte limit (\(twoScreens.wireMessage().count))")
+    func withScreens(_ s: [ClientScreen]) -> Data { QualityRequest(codec: .auto, chroma: .yuv420, bitrate: .auto, maxResolution: .p1080, fps: .fps30, hevcDecode: true, screens: s).wireMessage() }
+    var badScreen = cs(1, x: 1512); badScreen.scale = 3
+    var tiny = cs(1, x: 1512); tiny.width = 50
+    let badScreenLists: [[ClientScreen]] = [
+        [], (0..<5).map { cs($0, main: $0 == 0, x: Double($0) * 1512) }, [cs(0, main: true, x: 0), cs(0, x: 1512)],
+        [cs(0, main: true, x: 0), cs(1, main: true, x: 1512)], [cs(0, x: 0), cs(1, x: 1512)], [cs(0, main: true, x: 0), cs(2, x: 1512)],
+        [cs(0, main: true, x: 0), badScreen], [cs(0, main: true, x: 0), tiny], [cs(0, main: true, x: 0, show: "")],
+        [cs(0, main: true, x: 0, show: String(repeating: "x", count: 65))], [cs(4, main: true, x: 0)],
+    ]
+    for (i, s) in badScreenLists.enumerated() { require(QualityRequest.decodeWire(withScreens(s)) == nil, "bad screen list \(i) rejected") }
+    require(QualityRequest.decodeWire(Data([5]) + Data(#"{"codec":"auto","chroma":"420","bitrate":0,"maxResolution":"1080p","fps":30,"hevcDecode":true,"screens":[{"id":0,"isMain":true,"x":0,"y":0,"width":"wide","height":982,"pixelWidth":3024,"pixelHeight":1964,"scale":2}]}"#.utf8)) == nil, "type mismatch rejected")
+
+    let map = ScreenMap(screens: [.init(clientScreenId: 0, kind: .physical, hostDisplayName: "LG HDR 5K", hostDisplayId: "A", pixelWidth: 2560, pixelHeight: 1440),
+                                  .init(clientScreenId: 1, kind: .virtual, hostDisplayName: "가상 화면", hostDisplayId: "virtual", pixelWidth: 3024, pixelHeight: 1964)],
+                        switchable: [.init(id: "A", name: "LG HDR 5K"), .init(id: "B", name: "Studio Display")])
+    require(ScreenMap.decodeWire(map.wireMessage()) == map, "ScreenMap roundtrip")
+    func mutated(_ f: (inout ScreenMap) -> Void) -> Data { var c = map; f(&c); return c.wireMessage() }
+    let badMaps: [Data] = [
+        mutated { $0.screens = [] }, mutated { $0.screens = Array(repeating: $0.screens[0], count: 5).enumerated().map { var e = $1; e.clientScreenId = $0; return e } },
+        mutated { $0.screens[1].clientScreenId = 0 }, mutated { $0.screens[1].clientScreenId = 4 }, mutated { $0.screens[1].hostDisplayId = "B" },
+        mutated { $0.screens[0].hostDisplayId = "virtual" }, mutated { $0.screens[0].hostDisplayName = "" }, mutated { $0.screens[0].pixelWidth = 0 },
+        mutated { $0.switchable = Array(repeating: $0.switchable[0], count: 17) }, mutated { $0.switchable[0].id = "virtual" },
+        mutated { $0.screens[0].hostDisplayId = String(repeating: "x", count: 65) },
+        Data([6]) + map.wireMessage().dropFirst(), Data([7]), Data([7]) + Data("{}".utf8),
+        Data([7]) + Data(String(repeating: " ", count: 8200).utf8) + map.wireMessage().dropFirst(),
+    ]
+    for (i, d) in badMaps.enumerated() { require(ScreenMap.decodeWire(d) == nil, "bad ScreenMap \(i) rejected") }
+    let sw = ScreenSwitch(clientScreenId: 2, show: "virtual")
+    require(ScreenSwitch.decodeWire(sw.wireMessage()) == sw && ScreenSwitch.decodeWire(ScreenSwitch(clientScreenId: 4, show: "A").wireMessage()) == nil
+            && ScreenSwitch.decodeWire(ScreenSwitch(clientScreenId: 0, show: "").wireMessage()) == nil, "ScreenSwitch roundtrip and bounds")
+    require(KeyframeRequest.decode(KeyframeRequest.wire(3)) == 3 && KeyframeRequest.decode(Data([11, 4])) == nil
+            && KeyframeRequest.decode(Data([11])) == nil && KeyframeRequest.decode(Data([11, 0, 0])) == nil, "keyframe request bounds")
+    require(InputMessage(kind: .move, screen: 3).valid && !InputMessage(kind: .move, screen: 4).valid && !InputMessage(kind: .move, screen: -1).valid, "input screen bounds")
+    let legacyInput = try JSONDecoder().decode(InputMessage.self, from: Data(#"{"kind":"move","x":0.5,"y":0.5,"code":0,"flags":0,"dx":0,"dy":0}"#.utf8))
+    require(legacyInput.valid && legacyInput.screen == nil, "0.8 input without screen still decodes")
+    print("PASS screens and ScreenMap JSON roundtrip (3 screens \(reqWire.count) bytes, 2 screens fit 0.8's 512), \(badScreenLists.count + 1) bad screen lists and \(badMaps.count) bad ScreenMaps rejected, ScreenSwitch/keyframe/input screen bounds")
+
+    let injector = InputInjector()
+    injector.rects = [0: CGRect(x: 0, y: 0, width: 2561, height: 1441), 1: CGRect(x: 2560, y: 0, width: 2561, height: 1441), 2: CGRect(x: -1512, y: 100, width: 1513, height: 983)]
+    var posted = [CGEvent](); injector.postEvent = { posted.append($0) }
+    injector.apply(InputMessage(kind: .move, x: 0.5, y: 0.5, screen: 1))
+    injector.apply(InputMessage(kind: .move, x: 0, y: 1, screen: 2))
+    injector.apply(InputMessage(kind: .move, x: 1, y: 0))
+    injector.apply(InputMessage(kind: .move, x: 0.5, y: 0.5, screen: 3))
+    require(posted.map(\.location) == [CGPoint(x: 3840, y: 720), CGPoint(x: -1512, y: 1082), CGPoint(x: 2560, y: 0)], "pointer routed to each stream's display: \(posted.map(\.location))")
+    injector.rects = [1: CGRect(x: 2560, y: 0, width: 2560, height: 1440)]
+    injector.apply(InputMessage(kind: .keyDown, code: 0)); injector.apply(InputMessage(kind: .down, code: 0))
+    require(posted.count == 4 && injector.keys == [0] && injector.buttons.isEmpty, "keys still post without stream 0; a click for a missing stream does not")
+    injector.release()
+    print("PASS input routing: screen 1 -> (3840,720), screen 2 -> (-1512,1082), no screen -> stream 0, unknown stream dropped, keys need no matching stream")
+
+    let key = EdgePressure.Key(screen: 0, side: .left)
+    var e: EdgePressure?
+    require(!EdgePressure.advance(&e, key: key, now: 10.0, distance: 3) && e?.startedAt == 10.0, "first push starts an episode")
+    require(!EdgePressure.advance(&e, key: key, now: 10.1, distance: 3) && !EdgePressure.advance(&e, key: key, now: 10.2, distance: 3) && e?.distance == 9, "pushes inside 250 ms accumulate")
+    require(EdgePressure.advance(&e, key: key, now: 10.25, distance: 3) && e == nil, "250 ms of continuous pushing crosses")
+    _ = EdgePressure.advance(&e, key: key, now: 20.0); _ = EdgePressure.advance(&e, key: key, now: 20.1)
+    require(!EdgePressure.advance(&e, key: key, now: 20.26) && e?.startedAt == 20.26, "a 160 ms gap restarts the episode")
+    require(!EdgePressure.advance(&e, key: key, now: 20.4) && !EdgePressure.advance(&e, key: nil, now: 20.45) && e == nil, "direction change or held button resets")
+    _ = EdgePressure.advance(&e, key: key, now: 30.0)
+    require(!EdgePressure.advance(&e, key: EdgePressure.Key(screen: 0, side: .right), now: 30.3) && e?.key.side == .right && e?.startedAt == 30.3, "another edge restarts")
+    require(!EdgePressure.advance(&e, key: e!.key, now: 30.2) && e?.startedAt == 30.2, "time going backwards restarts")
+    _ = EdgePressure.advance(&e, key: key, now: 40.0, distance: .nan); _ = EdgePressure.advance(&e, key: key, now: 40.1, distance: 1e9)
+    require(e?.distance == 10_000 && !EdgePressure.advance(&e, key: key, now: .infinity) && e == nil, "distance clamps, nonfinite time resets")
+    print("PASS edge pressure: crosses after 250 ms of outward pushes, 150 ms gap / direction change / held button / other edge / backwards time reset, distance clamped")
+
+    let pair = [CGRect(x: 0, y: 0, width: 1512, height: 982), CGRect(x: 1512, y: 0, width: 1920, height: 1080)]
+    require(portalEdge(screens: pair, index: 0, point: CGPoint(x: 0, y: 500), dx: -3) == .left, "left outer edge")
+    require(portalEdge(screens: pair, index: 0, point: CGPoint(x: 1511, y: 500), dx: 3) == nil, "edge shared with a neighbour is not a portal")
+    require(portalEdge(screens: pair, index: 1, point: CGPoint(x: 3431, y: 500), dx: 3) == .right, "right outer edge")
+    require(portalEdge(screens: pair, index: 1, point: CGPoint(x: 1512, y: 500), dx: -3) == nil, "left edge of screen 2 beside screen 1")
+    require(portalEdge(screens: pair, index: 1, point: CGPoint(x: 1512, y: 1000), dx: -3) == .left, "left edge of screen 2 above screen 1's height is outer")
+    require(portalEdge(screens: pair, index: 0, point: CGPoint(x: 0, y: 500), dx: 3) == nil && portalEdge(screens: pair, index: 0, point: CGPoint(x: 500, y: 500), dx: -3) == nil
+            && portalEdge(screens: pair, index: 0, point: CGPoint(x: 0, y: 500), dx: 0) == nil && portalEdge(screens: pair, index: 5, point: .zero, dx: -1) == nil, "inward, interior, zero and bad index")
+    print("PASS portal edges: only left/right edges without a neighbouring screen at that height")
+
+    let D = EdgeSurfaceGeometry.maximumDepth
+    require(EdgeSurfaceGeometry.stretch(0) == 0 && EdgeSurfaceGeometry.stretch(-5) == 0 && EdgeSurfaceGeometry.stretch(.nan) == 0, "no push, no stretch")
+    require(abs(EdgeSurfaceGeometry.stretch(10) - (10 * D * 1.5 / (D + 15)) / (D - 1)) < 1e-12, "f(u) = u*D*1.5/(D+1.5u)")
+    let samples = stride(from: 0.0, through: 400, by: 5).map(EdgeSurfaceGeometry.stretch)
+    require(zip(samples, samples.dropFirst()).allSatisfy { $0 < $1 } && EdgeSurfaceGeometry.stretch(10_000) < D / (D - 1) && EdgeSurfaceGeometry.stretch(10_000) > 1.03, "monotonic, saturating below D")
+    let screen = CGRect(x: -30_000, y: -30_000, width: 1512, height: 982)
+    var g = EdgeSurfaceGeometry(side: .left, point: CGPoint(x: -30_000, y: -29_500), screenFrame: screen)
+    require(g.frame == CGRect(x: -30_000, y: -29_570, width: 26, height: 140) && g.anchor == CGPoint(x: 0, y: 0.5), "left surface 26 x 140 centred on the pointer: \(g.frame)")
+    g = EdgeSurfaceGeometry(side: .right, point: CGPoint(x: -28_489, y: -30_000), screenFrame: screen)
+    require(g.frame == CGRect(x: -28_514, y: -30_000, width: 26, height: 140) && g.anchor == CGPoint(x: 1, y: 0.5), "right surface clamped inside the screen: \(g.frame)")
+    let spring = EdgeSurfaceSpring(position: 0, velocity: 0, target: 1, startedAt: 0)
+    let s0 = spring.sample(at: 0), end = spring.sample(at: EdgeSurfaceSpring.duration)
+    require(abs(s0.position) < 1e-12 && abs(s0.velocity) < 1e-9 && abs(end.position - 1) < 0.01, "spring starts at rest and settles within 0.65 s")
+    let before = spring.sample(at: 0.1), turned = spring.retarget(0.5, at: 0.1, responseScale: 1.2), after = turned.sample(at: 0.1)
+    require(abs(before.position - after.position) < 1e-12 && abs(before.velocity - after.velocity) < 1e-9, "retarget keeps position and velocity continuous")
+    require(turned.animation(key: "transform.scale.x").values?.count == Int((EdgeSurfaceSpring.duration * 1.2 * 120).rounded()) + 1, "release animation sampled at 120 Hz for 0.65 s x 1.2")
+
+    _ = NSApplication.shared
+    let overlay = EdgeSurfaceOverlay()
+    overlay.reducedMotion = { true }
+    overlay.push(key: key, screenFrame: screen, point: CGPoint(x: -30_000, y: -29_500), distance: 12)
+    require(overlay.depthSpring == nil && overlay.panel?.ignoresMouseEvents == true && overlay.panel?.canBecomeKey == false && overlay.panel?.canHide == false
+            && overlay.panel?.frame.size == CGSize(width: 26, height: 140), "Reduce Motion: no spring, click-through non-key panel")
+    overlay.reset()
+    overlay.reducedMotion = { false }
+    overlay.push(key: key, screenFrame: screen, point: CGPoint(x: -30_000, y: -29_500), distance: 12)
+    require(overlay.depthSpring?.target == EdgeSurfaceGeometry.stretch(12), "normal motion drives the depth with the spring")
+    overlay.reset()
+    require(overlay.panel == nil, "reset removes the panel")
+    print("PASS rubber band: f(u) monotonic and saturating, 26x140 surface at the pushed edge, spring settles and stays continuous on retarget, Reduce Motion drops the spring (the 250 ms gate is separate)")
+
+    let suite = "com.tamcut.Pulsar.layouttest.\(UUID().uuidString)", d = UserDefaults(suiteName: suite)!
+    defer { d.removePersistentDomain(forName: suite) }
+    let layout = [cs(0, main: true, x: 0), cs(1, x: 1512, w: 1920, h: 1080)]
+    require(ScreenLayoutMemory.load(host: "mac-mini", screens: layout, d).isEmpty, "nothing saved yet")
+    ScreenLayoutMemory.save(host: "mac-mini", screens: layout, choices: [0: "B", 1: "virtual"], d)
+    require(ScreenLayoutMemory.load(host: "mac-mini", screens: layout, d) == [0: "B", 1: "virtual"], "load what was saved")
+    let reordered = [cs(0, x: 1512, w: 1920, h: 1080), cs(1, main: true, x: 0)]
+    require(ScreenLayoutMemory.load(host: "mac-mini", screens: reordered, d) == [1: "B", 0: "virtual"], "choices follow the screen, not its index")
+    let shifted = layout.map { var s = $0; s.x += 100; s.y += 50; return s }
+    require(ScreenLayoutMemory.load(host: "mac-mini", screens: shifted, d) == [0: "B", 1: "virtual"], "signature uses offsets from main")
+    require(ScreenLayoutMemory.load(host: "macbookpro", screens: layout, d).isEmpty, "other host has its own memory")
+    require(ScreenLayoutMemory.load(host: "mac-mini", screens: [cs(0, main: true, x: 0), cs(1, x: -1920, w: 1920, h: 1080)], d).isEmpty, "other arrangement has its own memory")
+    var remembered = layout
+    for i in remembered.indices { remembered[i].show = ScreenLayoutMemory.load(host: "mac-mini", screens: layout, d)[i] }
+    require(mapScreens(client: remembered, host: [A, B], singleScreenVirtual: false) == ScreenAssignment(sources: [0: .physical("B"), 1: .virtual], unused: ["A"]), "remembered layout reused")
+    require(mapScreens(client: remembered, host: [A], singleScreenVirtual: false) == ScreenAssignment(sources: [0: .physical("A"), 1: .virtual], unused: []), "saved display missing -> rule")
+    let prefs = StreamQualityPreferences.load(d)
+    require(!prefs.singleScreenVirtual && prefs.edgeReturn, "defaults: single-screen virtual off, edge return on")
+    print("PASS layout memory: per host and screen signature (sizes + offsets from main), follows screens across index changes, reused by the mapping, falls back when the saved display is gone")
 }

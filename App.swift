@@ -57,6 +57,7 @@ final class Viewer: NSView {
     var sendInput: ((InputMessage) -> Void)?
     var emergency: (() -> Void)?
     var focusChanged: (() -> Void)?
+    var tracksMouse = true
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { true }
     var contentRect: NSRect {
@@ -94,6 +95,7 @@ final class Viewer: NSView {
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         trackingAreas.forEach(removeTrackingArea)
+        guard tracksMouse else { return }
         addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect], owner: self, userInfo: nil))
     }
     override func becomeFirstResponder() -> Bool { focusChanged?(); return true }
@@ -144,6 +146,29 @@ final class Viewer: NSView {
     override func keyUp(with e: NSEvent) { sendInput?(InputMessage(kind: .keyUp, code: e.keyCode, flags: UInt64(e.modifierFlags.rawValue))) }
     override func flagsChanged(with e: NSEvent) { sendInput?(InputMessage(kind: .flags, code: e.keyCode, flags: UInt64(e.modifierFlags.rawValue))) }
 }
+// One host display (or virtual display) streamed to one viewer screen.
+final class HostStream {
+    let screen: Int
+    let capture = Capture()
+    var virtualDisplay: VirtualDisplay?
+    init(screen: Int) { self.screen = screen }
+    func stop() { capture.stop(); virtualDisplay?.destroy(); virtualDisplay = nil }
+}
+// A borderless window that may cover the menu bar area while the session hides the menu bar.
+final class ScreenWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+}
+struct RemoteScreen {
+    let id: Int
+    let window: ScreenWindow
+    let view: SessionView
+    var viewer: Viewer { view.viewer }
+}
+// window: the remote screen inside the Pulsar window. screens: one borderless window per viewer screen.
+// local: connected, but the pointer went back to this Mac through an edge portal.
+enum Presentation { case window, screens, local }
 // Tailscale first (works across networks), then private LAN, link-local bridges last.
 private func rank(_ a: (String, String)) -> Int { a.0.hasPrefix("Tailscale") ? 0 : a.1.hasPrefix("169.254.") ? 2 : 1 }
 final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
@@ -161,8 +186,23 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let preventSleep = NSSwitch()
     let guestInput = NSSwitch()
     let sleepAssertion = SleepAssertion()
-    var virtualDisplay: VirtualDisplay?
+    var streams = [HostStream]()
+    var streamRequest: QualityRequest?
     let viewer = Viewer()
+    var presentation = Presentation.window
+    var wantsScreens = true
+    var remoteScreens = [RemoteScreen]()
+    var clientScreens = [ClientScreen]()
+    var screenMap: ScreenMap?
+    var layoutHost = ""
+    var layoutChosen = false
+    var legacyHost = false
+    var edgeReturn = true
+    var edgePressure: EdgePressure?
+    var localPortal: EdgePressure.Key?
+    let edgeOverlay = EdgeSurfaceOverlay()
+    var statusItem: NSStatusItem?
+    var boardPressed = false
     let hostButton = NSButton(title: "공유 시작", target: nil, action: nil)
     var listener: NWListener?
     var secret: Data?
@@ -182,7 +222,6 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var inSession = false
     var frames = 0, bytes = 0
     var gestureNoted = false
-    var capture: Capture?
     var qualityWait: DispatchWorkItem?
     weak var awaitedPeer: Peer?
     let injector = InputInjector()
@@ -212,7 +251,10 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         viewer.emergency = { [weak self] in self?.stopAll() }
         // First responder changes only after become/resign return, so re-evaluate afterwards.
         viewer.focusChanged = { [weak self] in DispatchQueue.main.async { self?.updateHotKeys() } }
-        NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: window, queue: .main) { [weak self] _ in self?.outbound?.send(Data([2]) + (try! JSONEncoder().encode(InputMessage(kind: .release)))); self?.updateHotKeys() }
+        // Deferred: key focus moving between session screen windows is not a focus loss.
+        NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: nil, queue: .main) { [weak self] _ in
+            DispatchQueue.main.async { guard let self else { return }; if !self.forwardingKeys { self.sendInput(InputMessage(kind: .release)) }; self.updateHotKeys() }
+        }
         for name in [NSWindow.didBecomeKeyNotification, NSApplication.didBecomeActiveNotification, NSApplication.didResignActiveNotification] {
             NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.updateHotKeys() }
         }
@@ -220,7 +262,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // which AppKit never delivers to the view, so remote keys are not left held down.
         // Session shortcuts are matched first and stay on this Mac, along with their keyUp.
         NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] e in
-            guard let self, e.window === self.window else { return e }
+            guard let self, self.isSessionWindow(e.window) else { return e }
             if self.inSession, let action = ShortcutAction.matching(e) { self.consumedKey = e.keyCode; self.perform(action); return nil }
             if e.type == .keyUp, self.consumedKey == e.keyCode { self.consumedKey = nil; return nil }
             guard self.forwardingKeys else { return e }
@@ -231,11 +273,17 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             return nil
         }
+        // Screen windows send pointer input from here, by global position, so the pointer can cross screens.
+        NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp,
+                                                    .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .scrollWheel, .magnify, .rotate, .swipe, .smartMagnify]) { [weak self] e in
+            self?.routePointer(e) ?? e
+        }
+        NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved]) { [weak self] e in self?.localEdge(e) }
         host.onActive = { [weak self] p in self?.awaitQuality(for: p) }
         host.onInactive = { [weak self] in
             guard let self else { return }
             self.qualityWait?.cancel(); self.qualityWait = nil; self.awaitedPeer = nil
-            self.capture?.stop(); self.capture = nil; self.virtualDisplay = nil; self.injector.release(); self.statusText = "연결 해제됨. 공유는 대기 중입니다."
+            self.stopStreams(); self.injector.release(); self.statusText = "연결 해제됨. 공유는 대기 중입니다."
         }
         host.onPacket = { [weak self] p, data in self?.hostPacket(p, data) }
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
@@ -334,14 +382,27 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         content.show(page); tick()
     }
     @objc func showSettings() { select(2) }
-    @objc func toggleFullScreen() { window.toggleFullScreen(nil) }
+    // During a session this switches between the all-screens presentation and the Pulsar window.
+    @objc func toggleFullScreen() {
+        guard inSession else { window.toggleFullScreen(nil); return }
+        wantsScreens = presentation != .screens
+        if wantsScreens { presentScreens() } else { presentWindow() }
+    }
     func perform(_ action: ShortcutAction) {
         switch action {
         case .disconnect: disconnectViewer(); statusText = "연결을 종료했습니다."
-        case .overlay: sessionView.togglePinned()
+        case .overlay: currentBoard.togglePinned()
         case .fullScreen: toggleFullScreen()
         }
     }
+    var boards: [SessionView] { [sessionView] + remoteScreens.map(\.view) }
+    var currentBoard: SessionView {
+        guard presentation == .screens else { return sessionView }
+        return remoteScreen(at: NSEvent.mouseLocation)?.view ?? remoteScreens.first?.view ?? sessionView
+    }
+    func remoteScreen(at p: NSPoint) -> RemoteScreen? { remoteScreens.first { NSMouseInRect(p, $0.window.frame, false) } }
+    func isSessionWindow(_ w: NSWindow?) -> Bool { w != nil && (w === window || remoteScreens.contains { $0.window === w }) }
+    func sendInput(_ m: InputMessage) { if let data = try? JSONEncoder().encode(m) { outbound?.send(Data([2]) + data) } }
     func refreshHostState() {
         hostButton.title = hosting ? "공유 중지" : "공유 시작"
         allowAccess.state = hosting ? .on : .off
@@ -370,7 +431,8 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func tick() {
         if inSession {
             guard outbound?.ready == true else { return }
-            sessionView.live(peer: peerName, metrics: String(format: "%d fps  ·  %.1f Mbps", frames, Double(bytes) * 8 / 1_000_000))
+            let text = String(format: "%d fps  ·  %.1f Mbps", frames, Double(bytes) * 8 / 1_000_000)
+            for b in boards { b.live(peer: peerName, metrics: text) }
             frames = 0; bytes = 0
         } else if window.isVisible {
             if content.current == 0 { computers.refreshPermissions() }
@@ -388,10 +450,13 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             sessionView.setQuality("")
             split.splitViewItems[0].isCollapsed = true
             sessionView.isHidden = false
+            buildScreenWindows()
+            updateStatusItem()
+            if wantsScreens { presentScreens() } else { presentWindow() }
         }
         settings.setConnected(true)
-        sessionView.live(peer: peerName, metrics: "측정 중")
-        sessionView.flash(3)
+        for b in boards { b.live(peer: peerName, metrics: "측정 중") }
+        if presentation != .local { currentBoard.flash(3) }
     }
     func leaveSession() {
         guard inSession else { return }
@@ -399,7 +464,182 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         sessionView.setQuality(""); settings.setConnected(false)
         sessionView.isHidden = true
         split.splitViewItems[0].isCollapsed = false
+        tearDownScreenWindows()
+        presentation = .window; localPortal = nil; edgePressure = nil; edgeOverlay.reset()
+        screenMap = nil; legacyHost = false; layoutChosen = false; sessionView.setMonitors([], current: nil)
+        updateStatusItem()
+        if NSApp.isHidden { NSApp.unhide(nil) }
+        window.makeKeyAndOrderFront(nil)
         select(returnPage)
+    }
+
+    // MARK: Viewer screens
+
+    func buildScreenWindows() {
+        tearDownScreenWindows()
+        let screens = Array(NSScreen.screens.prefix(maxScreenStreams))
+        for (i, screen) in screens.enumerated() where clientScreens.indices.contains(i) {
+            let viewer = Viewer(); viewer.tracksMouse = false
+            let view = SessionView(viewer: viewer); view.tracksMouse = false
+            viewer.topAnchor.constraint(equalTo: view.topAnchor).isActive = true
+            view.fullScreen.title = "창으로 보기"; view.fullScreen.target = self; view.fullScreen.action = #selector(toggleFullScreen)
+            view.leave.target = self; view.leave.action = #selector(disconnectViewer)
+            view.monitors.target = self; view.monitors.action = #selector(switchMonitor(_:)); view.monitors.tag = i
+            let w = ScreenWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+            w.isReleasedWhenClosed = false; w.backgroundColor = .black; w.hidesOnDeactivate = false
+            w.acceptsMouseMovedEvents = true; w.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle]
+            w.contentView = view; w.setFrame(screen.frame, display: false)
+            remoteScreens.append(RemoteScreen(id: i, window: w, view: view))
+        }
+        refreshMonitorMenus()
+    }
+    func tearDownScreenWindows() {
+        for rs in remoteScreens { rs.viewer.clear(); rs.window.orderOut(nil); rs.window.close() }
+        remoteScreens = []
+        NSApp.presentationOptions = []
+    }
+    func presentScreens() {
+        guard inSession, !remoteScreens.isEmpty else { presentWindow(); return }
+        edgeReturn = StreamQualityPreferences.load().edgeReturn
+        presentation = .screens; localPortal = nil; edgePressure = nil
+        window.orderOut(nil)
+        if NSApp.isHidden { NSApp.unhide(nil) }
+        NSApp.activate(ignoringOtherApps: true)
+        for rs in remoteScreens { rs.window.orderFrontRegardless() }
+        (remoteScreen(at: NSEvent.mouseLocation) ?? remoteScreens[0]).window.makeKeyAndOrderFront(nil)
+        NSApp.presentationOptions = [.hideDock, .hideMenuBar]
+        sessionView.viewer.format = nil
+        requestKeyframes()
+        updateHotKeys()
+    }
+    func presentWindow() {
+        presentation = .window; localPortal = nil; edgePressure = nil
+        hideScreens()
+        if NSApp.isHidden { NSApp.unhide(nil) }
+        window.makeKeyAndOrderFront(nil); window.makeFirstResponder(viewer)
+        requestKeyframes()
+        updateHotKeys()
+    }
+    // Hidden viewers drop their decoder state so they resume from the next keyframe, not from stale references.
+    func hideScreens() {
+        for rs in remoteScreens { rs.window.orderOut(nil); rs.viewer.format = nil }
+        NSApp.presentationOptions = []
+    }
+    func goLocal(_ key: EdgePressure.Key, at point: NSPoint) {
+        sendInput(InputMessage(kind: .release))
+        presentation = .local; localPortal = key
+        hideScreens()
+        updateHotKeys()
+        if clientScreens.indices.contains(key.screen) {
+            let f = clientScreens[key.screen].frame, top = NSScreen.screens.first?.frame.maxY ?? f.maxY
+            let x = key.side == .left ? f.minX + 4 : f.maxX - 5
+            CGWarpMouseCursorPosition(CGPoint(x: x, y: top - min(max(point.y, f.minY + 1), f.maxY - 1)))
+            CGAssociateMouseAndMouseCursorPosition(1)
+        }
+        // Hiding hands keyboard focus to the app underneath. The edge surface sets canHide = false.
+        NSApp.hide(nil)
+    }
+    func requestKeyframes() {
+        guard screenMap != nil else { return }
+        let ids = presentation == .screens ? remoteScreens.map(\.id) : [0]
+        for id in ids { outbound?.send(KeyframeRequest.wire(id)) }
+    }
+    func refreshMonitorMenus() {
+        guard let map = screenMap else { for b in boards { b.setMonitors([], current: nil) }; return }
+        let choices = map.switchable.map { (title: $0.name, wire: $0.id) } + [(title: "가상 화면", wire: ScreenSource.virtualWire)]
+        func current(_ id: Int) -> String? { map.screens.first { $0.clientScreenId == id }?.hostDisplayId }
+        for rs in remoteScreens { rs.view.setMonitors(choices, current: current(rs.id)) }
+        sessionView.setMonitors(choices, current: current(0))
+    }
+    var currentChoices: [Int: String] { Dictionary((screenMap?.screens ?? []).map { ($0.clientScreenId, $0.hostDisplayId) }, uniquingKeysWith: { a, _ in a }) }
+    @objc func switchMonitor(_ sender: NSPopUpButton) {
+        guard screenMap != nil, let wire = sender.selectedItem?.representedObject as? String, clientScreens.indices.contains(sender.tag) else { return }
+        outbound?.send(ScreenSwitch(clientScreenId: sender.tag, show: wire).wireMessage())
+        var choices = currentChoices; choices[sender.tag] = wire
+        layoutChosen = true
+        ScreenLayoutMemory.save(host: layoutHost, screens: clientScreens, choices: choices)
+    }
+    func updateStatusItem() {
+        if inSession, statusItem == nil {
+            let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+            item.button?.image = NSImage(systemSymbolName: "display.2", accessibilityDescription: "Pulsar")
+            let menu = NSMenu()
+            menu.addItem(withTitle: "원격 화면으로 들어가기", action: #selector(returnToRemote), keyEquivalent: "").target = self
+            menu.addItem(withTitle: "연결 종료", action: #selector(disconnectViewer), keyEquivalent: "").target = self
+            item.menu = menu; statusItem = item
+        } else if !inSession, let item = statusItem {
+            NSStatusBar.system.removeStatusItem(item); statusItem = nil
+        }
+    }
+    @objc func returnToRemote() { guard inSession else { return }; wantsScreens = true; presentScreens() }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard inSession, presentation == .local else { return true }
+        presentScreens(); return false
+    }
+    static func pointerKind(_ type: NSEvent.EventType) -> InputMessage.Kind? {
+        switch type {
+        case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged: return .move
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown: return .down
+        case .leftMouseUp, .rightMouseUp, .otherMouseUp: return .up
+        case .scrollWheel: return .scroll
+        case .magnify, .rotate, .swipe, .smartMagnify: return .gesture
+        default: return nil
+        }
+    }
+    // Returns nil when the event went to the remote Mac. Board controls and the windowed viewer keep normal dispatch.
+    func routePointer(_ e: NSEvent) -> NSEvent? {
+        switch presentation {
+        case .local: if e.type == .mouseMoved { localEdge(e) }; return e
+        case .window: return e
+        case .screens: break
+        }
+        let global = NSEvent.mouseLocation
+        guard inSession, let rs = remoteScreen(at: global), let kind = Self.pointerKind(e.type) else { return e }
+        let windowPoint = rs.window.convertPoint(fromScreen: global)
+        if kind == .move {
+            for o in remoteScreens {
+                if o.id == rs.id { o.view.pointer(atY: o.viewer.convert(windowPoint, from: nil).y) } else { o.view.pointerLeft() }
+            }
+        }
+        // A press that starts on a board control stays with the board until its mouse-up; any other
+        // mouse-up goes to the remote Mac so no remote button is left held.
+        if kind == .down, rs.view.boardContains(windowPoint: windowPoint) { boardPressed = true }
+        if boardPressed {
+            if kind == .up { boardPressed = false }
+            advanceEdge(nil, point: global, now: e.timestamp); return e
+        }
+        let p = rs.viewer.convert(windowPoint, from: nil), r = rs.viewer.contentRect
+        if r.width > 0, r.height > 0,
+           var m = kind == .gesture ? Viewer.gestureMessage(e, point: p, rect: r) : Viewer.inputMessage(e, kind, point: p, rect: r) {
+            m.screen = rs.id
+            sendInput(m)
+        }
+        if e.type == .mouseMoved, edgeReturn, NSEvent.pressedMouseButtons == 0,
+           let side = portalEdge(screens: clientScreens.map(\.frame), index: rs.id, point: global, dx: e.deltaX) {
+            advanceEdge(EdgePressure.Key(screen: rs.id, side: side), point: global, now: e.timestamp, distance: abs(e.deltaX))
+        } else {
+            advanceEdge(nil, point: global, now: e.timestamp)
+        }
+        return nil
+    }
+    // While local, only the edge the pointer came back through leads into the remote screens again.
+    func localEdge(_ e: NSEvent) {
+        guard presentation == .local, inSession, let key = localPortal else { return }
+        let global = NSEvent.mouseLocation
+        let side = edgeReturn && NSEvent.pressedMouseButtons == 0 && outbound?.ready == true
+            ? portalEdge(screens: clientScreens.map(\.frame), index: key.screen, point: global, dx: e.deltaX) : nil
+        advanceEdge(side == key.side ? key : nil, point: global, now: e.timestamp, distance: abs(e.deltaX))
+    }
+    func advanceEdge(_ key: EdgePressure.Key?, point: NSPoint, now: Double, distance: Double = 0) {
+        let had = edgePressure != nil
+        if EdgePressure.advance(&edgePressure, key: key, now: now, distance: distance), let key {
+            edgeOverlay.release(crossed: true)
+            if presentation == .local { presentScreens() } else { goLocal(key, at: point) }
+        } else if let p = edgePressure, clientScreens.indices.contains(p.key.screen) {
+            edgeOverlay.push(key: p.key, screenFrame: clientScreens[p.key.screen].frame, point: point, distance: p.distance)
+        } else if had {
+            edgeOverlay.release(crossed: false)
+        }
     }
     @objc func allowAccessChanged() {
         if allowAccess.state == .on {
@@ -493,71 +733,113 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         awaitedPeer = p
         statusText = (p.greet ? "Tailscale로 연결됨." : "암호화 연결됨.") + " 화면 품질 확인 중…"
         let work = DispatchWorkItem { [weak self, weak p] in
-            guard let self, let p, self.host.active === p, self.awaitedPeer === p, self.capture == nil else { return }
+            guard let self, let p, self.host.active === p, self.awaitedPeer === p, self.streams.isEmpty else { return }
             self.awaitedPeer = nil; self.qualityWait = nil
             self.startCapture(for: p, request: nil)
         }
         qualityWait = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
     }
+    func stopStreams() {
+        for s in streams { s.stop() }
+        streams = []; streamRequest = nil; injector.rects = [:]
+    }
+    // A 0.8 viewer (no screen list) gets one stream in the 0.8 wire format: the main display, or a virtual
+    // display when it asked for one. A 0.9 viewer gets one stream per screen as decided by mapScreens.
     func startCapture(for p: Peer, request: QualityRequest?) {
         gestureNoted = false
-        virtualDisplay = nil
-        let sendEffective = request != nil
+        stopStreams()
+        streamRequest = request
+        statusText = (p.greet ? "Tailscale로 연결됨." : "암호화 연결됨.") + " 화면 전송 준비 중…"
+        guard let screens = request?.screens else {
+            let vd = request?.virtualDisplay.flatMap { $0.enabled ? ($0.width, $0.height, $0.scale) : nil }
+            startStream(for: p, request: request, screen: 0, streamed: false, source: vd == nil ? nil : .virtual, size: vd)
+            return
+        }
+        let assignment = mapScreens(client: screens, host: HostDisplay.streamable(HostDisplay.online()), singleScreenVirtual: request?.virtualDisplay?.enabled ?? false)
+        for c in screens {
+            startStream(for: p, request: request, screen: c.id, streamed: true, source: assignment.sources[c.id] ?? .virtual, size: (c.pixelWidth, c.pixelHeight, c.scale))
+        }
+    }
+    // `source` nil or a missing physical display captures the main display.
+    func startStream(for p: Peer, request: QualityRequest?, screen: Int, streamed: Bool, source: ScreenSource?, size: (Int, Int, Int)?) {
         let prefix = p.greet ? "Tailscale로 연결됨." : "암호화 연결됨."
         let inputNote = p.kind == .owner ? "같은 계정: 마우스·키보드 허용" : (guestInput.state == .on ? "연결코드: 마우스·키보드 허용" : "연결코드: 보기 전용")
-        statusText = prefix + " 화면 전송 준비 중…"
-        let capture = Capture(); self.capture = capture
-        capture.onFrame = { [weak self, weak p, weak capture] data, sent in guard let self = self, let capture = capture, self.host.active === p, self.capture === capture else { return }; p?.frame(data, sent: sent) }
-        capture.onError = { [weak self, weak p] message in guard let self = self, self.host.active === p else { return }; p?.close(); self.statusText = message }
-
-        var createdVD: VirtualDisplay?
-        var vdFallback = false
-        if let vdReq = request?.virtualDisplay, vdReq.enabled {
-            if let vd = VirtualDisplay(width: vdReq.width, height: vdReq.height, scale: vdReq.scale) {
-                createdVD = vd
-                self.virtualDisplay = vd
-            } else {
-                vdFallback = true
-            }
+        let s = HostStream(screen: screen); streams.append(s)
+        let capture = s.capture
+        capture.streamIndex = streamed ? UInt8(screen) : nil
+        capture.onFrame = { [weak self, weak p, weak s] data, sent in
+            guard let self, let s, self.host.active === p, self.streams.contains(where: { $0 === s }) else { return }
+            p?.frame(data, sent: sent)
         }
-
+        capture.onError = { [weak self, weak p] message in guard let self = self, self.host.active === p else { return }; p?.close(); self.statusText = message }
+        var target: CGDirectDisplayID?
+        var vdFallback = false
+        switch source {
+        case .virtual?:
+            if let size, let vd = VirtualDisplay(width: size.0, height: size.1, scale: size.2) { s.virtualDisplay = vd } else { vdFallback = true }
+        case .physical(let id)?:
+            target = HostDisplay.online().first { $0.id == id }?.cgID
+        case nil: break
+        }
         Task { @MainActor in
+            let alive = { self.host.active === p && self.streams.contains { $0 === s } }
             do {
                 let actual: EffectiveQuality
-                if let vd = createdVD {
+                if let vd = s.virtualDisplay {
                     do {
-                        actual = try await capture.start(request: request, targetDisplayID: vd.displayID, fallbackPixelSize: (vd.pixelWidth, vd.pixelHeight))
-                    } catch where self.host.active === p && self.capture === capture {
-                        if self.virtualDisplay === vd { self.virtualDisplay = nil }
+                        actual = try await capture.start(request: request, targetDisplayID: vd.displayID, isVirtual: true, fallbackPixelSize: (vd.pixelWidth, vd.pixelHeight))
+                    } catch where alive() {
+                        s.virtualDisplay?.destroy(); s.virtualDisplay = nil
                         vdFallback = true
                         actual = try await capture.start(request: request, targetDisplayID: nil)
                     }
                 } else {
-                    actual = try await capture.start(request: request, targetDisplayID: nil)
+                    actual = try await capture.start(request: request, targetDisplayID: target)
                 }
-                if self.host.active === p, self.capture === capture {
-                    self.injector.rect = capture.rect
-                    if sendEffective { p.send(actual.wireMessage()) }
-                    let fallbackNote = vdFallback ? " 가상 화면을 만들지 못해 기본 화면을 전송합니다." : ""
-                    self.statusText = prefix + " 화면 전송 중 (\(actual.summary), \(inputNote))." + fallbackNote
-                } else {
-                    if let vd = createdVD, self.virtualDisplay === vd { self.virtualDisplay = nil }
-                    capture.stop()
-                }
+                guard alive() else { s.stop(); return }
+                if request != nil { p.send(actual.wireMessage()) }
+                if streamed { p.send(self.hostScreenMap().wireMessage()) }
+                let fallbackNote = vdFallback ? " 가상 화면을 만들지 못해 기본 화면을 전송합니다." : ""
+                let count = self.streams.count > 1 ? " 화면 \(self.streams.count)개," : ""
+                self.statusText = prefix + " 화면 전송 중 (\(count)\(actual.summary), \(inputNote))." + fallbackNote
             } catch {
-                if let vd = createdVD, self.virtualDisplay === vd { self.virtualDisplay = nil }
-                guard self.host.active === p, self.capture === capture else { return }
+                s.stop()
+                guard alive() else { return }
                 p.close(); self.statusText = "화면 캡처 실패. 화면 기록 권한과 로그인 상태를 확인하세요."
             }
         }
     }
+    func hostScreenMap() -> ScreenMap {
+        let displays = HostDisplay.streamable(HostDisplay.online())
+        let entries = streams.sorted { $0.screen < $1.screen }.map { s -> ScreenMap.Entry in
+            let w = max(2, s.capture.outputSize.width), h = max(2, s.capture.outputSize.height)
+            if s.virtualDisplay != nil {
+                return ScreenMap.Entry(clientScreenId: s.screen, kind: .virtual, hostDisplayName: "가상 화면", hostDisplayId: ScreenSource.virtualWire, pixelWidth: w, pixelHeight: h)
+            }
+            let d = displays.first { $0.cgID == s.capture.displayID }
+            return ScreenMap.Entry(clientScreenId: s.screen, kind: .physical, hostDisplayName: String((d?.name ?? "기본 화면").prefix(128)),
+                                   hostDisplayId: d?.id ?? "display-\(s.capture.displayID)", pixelWidth: w, pixelHeight: h)
+        }
+        return ScreenMap(screens: entries, switchable: displays.prefix(16).map { ScreenMap.Display(id: $0.id, name: String($0.name.prefix(128))) })
+    }
     func hostPacket(_ p: Peer, _ data: Data) {
         if data == Data([3]) { return }
         if data.first == QualityRequest.messageType {
-            guard awaitedPeer === p, capture == nil, let req = QualityRequest.decodeWire(data) else { p.close(); return }
+            guard awaitedPeer === p, streams.isEmpty, let req = QualityRequest.decodeWire(data) else { p.close(); return }
             qualityWait?.cancel(); qualityWait = nil; awaitedPeer = nil
             startCapture(for: p, request: req)
+            return
+        }
+        if data.first == ScreenSwitch.messageType {
+            guard let sw = ScreenSwitch.decodeWire(data), let req = streamRequest, let c = req.screens?.first(where: { $0.id == sw.clientScreenId }) else { p.close(); return }
+            if let old = streams.first(where: { $0.screen == c.id }) { old.stop(); streams.removeAll { $0 === old }; injector.rects[c.id] = nil }
+            startStream(for: p, request: req, screen: c.id, streamed: true, source: ScreenSource(wire: sw.show), size: (c.pixelWidth, c.pixelHeight, c.scale))
+            return
+        }
+        if data.first == KeyframeRequest.messageType {
+            guard let id = KeyframeRequest.decode(data) else { p.close(); return }
+            streams.first { $0.screen == id }?.capture.requestKeyframe()
             return
         }
         // Malformed messages close the connection; a well-formed gesture the host cannot replay is ignored.
@@ -569,6 +851,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if !gestureNoted { gestureNoted = true; statusText = "두 Mac의 macOS 빌드가 달라 트랙패드 제스처를 무시합니다." }
             return
         }
+        // Read live: another virtual display appearing can move this one.
+        let screen = m.screen ?? 0
+        if let s = streams.first(where: { $0.screen == screen }), s.capture.displayID != 0 { injector.rects[screen] = CGDisplayBounds(s.capture.displayID) }
         injector.apply(m)
     }
     @objc func copyCode() {
@@ -590,8 +875,12 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         p.onReady = { [weak self, weak p] in
             guard let self, let p else { return }
             let prefs = StreamQualityPreferences.load()
-            let vd = VirtualDisplayRequest.forScreen(self.window.screen ?? NSScreen.main, enabled: prefs.useVirtualDisplay)
-            let req = prefs.request(hevcDecode: VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC), virtualDisplay: vd)
+            // A redial keeps the screens the session windows were built for.
+            if !self.inSession { self.clientScreens = ClientScreen.list(NSScreen.screens); self.layoutHost = self.peerName }
+            let saved = ScreenLayoutMemory.load(host: self.layoutHost, screens: self.clientScreens)
+            for i in self.clientScreens.indices { self.clientScreens[i].show = saved[self.clientScreens[i].id] }
+            let vd = VirtualDisplayRequest.forScreen(NSScreen.screens.first, enabled: prefs.singleScreenVirtual)
+            let req = prefs.request(hevcDecode: VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC), virtualDisplay: vd, screens: self.clientScreens)
             p.send(req.wireMessage())
             self.session.connected()
             self.statusText = (p.greet ? "Tailscale로 연결됨." : "암호화 연결됨.") + " 화면을 클릭해 입력하세요. Command+Option+Escape는 긴급 중지입니다." + (AXIsProcessTrusted() ? "" : " 시스템 단축키와 제스처 전달에는 이 Mac의 기기 제어 및 데이터 접근과 입력 모니터링 권한이 필요합니다.")
@@ -603,12 +892,37 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self = self else { return }
             if data.first == EffectiveQuality.messageType {
                 guard let eff = EffectiveQuality.decodeWire(data) else { p?.close(); return }
-                self.sessionView.setQuality(eff.summary)
+                for b in self.boards { b.setQuality(eff.summary) }
                 self.settings.setLastEffective(eff.summary)
                 return
             }
-            guard let frame = try? VideoFrame.parse(data), self.viewer.show(frame) else { p?.close(); return }
-            self.frames += 1; self.bytes += data.count
+            if data.first == ScreenMap.messageType {
+                guard let map = ScreenMap.decodeWire(data) else { p?.close(); return }
+                self.screenMap = map
+                self.refreshMonitorMenus()
+                // One screen remembers only an explicit choice, so the single-screen virtual setting keeps working.
+                if self.clientScreens.count > 1 || self.layoutChosen {
+                    ScreenLayoutMemory.save(host: self.layoutHost, screens: self.clientScreens, choices: self.currentChoices)
+                }
+                return
+            }
+            guard let frame = try? VideoFrame.parse(data) else { p?.close(); return }
+            // A 0.8 host streams only its main display, so only this Mac's main screen keeps a window.
+            if frame.stream == nil, !self.legacyHost {
+                self.legacyHost = true
+                for rs in self.remoteScreens where rs.id != 0 { rs.window.orderOut(nil); rs.window.close() }
+                self.remoteScreens.removeAll { $0.id != 0 }
+            }
+            let id = Int(frame.stream ?? 0)
+            let target: Viewer?
+            switch self.presentation {
+            case .screens: target = self.remoteScreens.first { $0.id == id }?.viewer
+            case .window: target = id == 0 ? self.viewer : nil
+            case .local: target = nil
+            }
+            if let target, !target.show(frame) { p?.close(); return }
+            if id == 0 { self.frames += 1 }
+            self.bytes += data.count
         }
         // The last frame stays on screen while redialing.
         p.onClose = { [weak self, weak p] in
@@ -617,7 +931,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             switch self.session.closed(failure: p.failure, refused: p.greet && p.connected) {
             case .retry(let attempt):
                 self.statusText = "재연결 중… (\(attempt)회)"
-                if self.inSession { self.sessionView.reconnecting(attempt, peer: self.peerName) }
+                if self.inSession { for b in self.boards { b.reconnecting(attempt, peer: self.peerName) } }
                 let generation = self.session.generation
                 DispatchQueue.main.asyncAfter(deadline: .now() + ViewerSession.retryDelay) { [weak self] in
                     guard let self, self.session.generation == generation, self.outbound == nil else { return }
@@ -632,13 +946,20 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         p.start()
     }
     @objc func disconnectViewer() { session.stop(); let p = outbound; outbound = nil; p?.close(); viewer.clear(); leaveSession(); updateHotKeys() }
-    var forwardingKeys: Bool { outbound?.ready == true && window.isKeyWindow && window.firstResponder === viewer }
+    var forwardingKeys: Bool {
+        guard outbound?.ready == true else { return false }
+        switch presentation {
+        case .window: return window.isKeyWindow && window.firstResponder === viewer
+        case .screens: return remoteScreens.contains { $0.window.isKeyWindow }
+        case .local: return false
+        }
+    }
     func updateHotKeys() { hotKeys.set(forwardingKeys && NSApp.isActive && AXIsProcessTrusted() && ShortcutAction.sendsSystem()) }
     func stopHost() {
         qualityWait?.cancel(); qualityWait = nil; awaitedPeer = nil
         hosting = false; listener?.cancel(); listener = nil; tailnetListener?.cancel(); tailnetListener = nil; tailnetState.stringValue = "꺼짐"
         host.closeAll()
-        capture?.stop(); capture = nil; virtualDisplay = nil; injector.release(); token = nil; secret = nil
+        stopStreams(); injector.release(); token = nil; secret = nil
         refreshHostState(); statusText = "공유를 중지했습니다."
     }
     @objc func stopAll() { stopHost(); disconnectViewer(); statusText = "모든 연결을 중지했습니다. 새로 공유하면 새 비밀키를 만듭니다." }
