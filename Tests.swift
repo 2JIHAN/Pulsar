@@ -42,6 +42,7 @@ func runSelfTests() {
         precondition(s.valid && s.dy == -1000 && s.code == 0)
         print("PASS viewer builds valid input messages from real mouse and scroll NSEvents")
         try videoTests()
+        try latencyTests()
         qualityTests()
         try multiScreenTests()
         let injector = InputInjector(); injector.rects = [0: CGRect(x: 0, y: 0, width: 1440, height: 900)]
@@ -139,13 +140,15 @@ func testPixelBuffer(width: Int, height: Int, shade: Int, format: OSType = kCVPi
     CVPixelBufferUnlockBaseAddress(pixel, [])
     return pixel
 }
-func encodeTestFrames(width: Int, height: Int, keyframes: Set<Int>, count: Int, quality: EffectiveQuality = .legacyDefaults, stream: UInt8? = nil) throws -> [Data] {
+extension EncodedFrame { var data: Data? { if case .message(let d) = self { return d }; return nil } }
+func encodeTestFrames(width: Int, height: Int, keyframes: Set<Int>, count: Int, quality: EffectiveQuality = .legacyDefaults, stream: UInt8? = nil,
+                      onDemandKeyframes: Bool = false, timing: FrameTiming? = nil) throws -> [Data] {
     var messages = [Data?]()
     let lock = NSLock(), done = DispatchSemaphore(value: 0)
-    let encoder = try VideoEncoder(width: width, height: height, quality: quality, stream: stream) { m in lock.lock(); messages.append(m); lock.unlock(); done.signal() }
+    let encoder = try VideoEncoder(width: width, height: height, quality: quality, stream: stream, onDemandKeyframes: onDemandKeyframes) { m in lock.lock(); messages.append(m.data); lock.unlock(); done.signal() }
     let fmt = encoder.effectiveQuality.chroma == .yuv444 ? kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
     for i in 0..<count {
-        precondition(encoder.encode(testPixelBuffer(width: width, height: height, shade: i, format: fmt), time: CMTime(value: Int64(i), timescale: Int32(quality.fps.rawValue)), keyframe: keyframes.contains(i)))
+        precondition(encoder.encode(testPixelBuffer(width: width, height: height, shade: i, format: fmt), time: CMTime(value: Int64(i), timescale: Int32(quality.fps.rawValue)), keyframe: keyframes.contains(i), timing: timing, capturedAt: mach_absolute_time()))
         precondition(done.wait(timeout: .now() + 5) == .success)
     }
     lock.lock(); defer { lock.unlock() }
@@ -183,7 +186,7 @@ func videoTests() throws {
     precondition(oversized.keyframe && videoFormat(oversized) == nil)
     let key = frames[0], unit: [UInt8] = [0, 0, 0, 1, 0x41]
     let bad: [Data] = [
-        Data([4]), Data([4, 0]), Data([1] + messages[1].dropFirst()), Data([4, 4] + messages[1].dropFirst(2)),
+        Data([4]), Data([4, 0]), Data([1] + messages[1].dropFirst()), Data([4, 8] + messages[1].dropFirst(2)),
         Data(messages[0].dropLast()), Data(messages[1] + [0]), Data([4, 0, 0, 0, 0, 0, 0x41]), Data([4, 0, 0xff, 0xff, 0xff, 0xff, 0x41]),
         Data([4, 1, 0, 0] + messages[0].dropFirst(4)), Data([4, 1]) + key.avcc,
         VideoFrame(codec: .h264, keyframe: true, parameterSets: key.parameterSets.reversed(), avcc: key.avcc).message,
@@ -200,7 +203,7 @@ func videoTests() throws {
     var streamedDelta = frames[1]; streamedDelta.stream = 1
     let deltaWire = streamedDelta.message
     let badStream: [Data] = [
-        Data([8, 4]) + deltaWire.dropFirst(2), Data([8, 255]) + deltaWire.dropFirst(2), Data([8, 1, 4]) + deltaWire.dropFirst(3),
+        Data([8, 4]) + deltaWire.dropFirst(2), Data([8, 255]) + deltaWire.dropFirst(2), Data([8, 1, 8]) + deltaWire.dropFirst(3),
         Data([8, 1]), Data([8, 1, 0]), Data([8, 1, 0, 0, 0, 0, 0x41]), Data(streamedWire.dropLast()), Data(deltaWire + [0]),
         Data([8, 1, 1, 0, 0]) + key.avcc,
     ]
@@ -254,7 +257,7 @@ func videoTests() throws {
         let req444 = EffectiveQuality(codec: .hevc, chroma: .yuv444, bitrateMbps: 20, maxResolution: .p1440, fps: .fps30)
         var out444 = [Data?]()
         let done444 = DispatchSemaphore(value: 0)
-        let enc444 = try VideoEncoder(width: 1280, height: 720, quality: req444) { m in out444.append(m); done444.signal() }
+        let enc444 = try VideoEncoder(width: 1280, height: 720, quality: req444) { m in out444.append(m.data); done444.signal() }
         let effChroma = enc444.effectiveQuality.chroma
         if effChroma == .yuv444 {
             precondition(enc444.encode(testPixelBuffer(width: 1280, height: 720, shade: 1, format: kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange), time: .zero, keyframe: true))
@@ -342,7 +345,13 @@ func qualityTests() {
     saved.save(defaults)
     precondition(StreamQualityPreferences.load(defaults) == saved)
     precondition(StreamQualityPreferences(codec: .h264, chroma: .yuv444, bitrate: .auto, maxResolution: .p1080, fps: .fps30).request(hevcDecode: true).chroma == .yuv420)
-    print("PASS quality request/effective JSON roundtrip (with/without virtualDisplay), bounds rejection, host resolution, scaling and UserDefaults persistence")
+    let adaptiveReq = StreamQualityPreferences().request(hevcDecode: true)
+    precondition(StreamQualityPreferences().adaptiveBitrate && adaptiveReq.timing == true && adaptiveReq.adaptive == true && QualityRequest.decodeWire(adaptiveReq.wireMessage()) == adaptiveReq)
+    var manual = StreamQualityPreferences(); manual.adaptiveBitrate = false; manual.save(defaults)
+    precondition(StreamQualityPreferences.load(defaults).request(hevcDecode: true).adaptive == false && decodedLegacyReq?.timing == nil && decodedLegacyReq?.adaptive == nil)
+    let timedEff = EffectiveQuality(codec: .hevc, chroma: .yuv420, bitrateMbps: 20, maxResolution: .p1440, fps: .fps60, timing: true)
+    precondition(EffectiveQuality.decodeWire(timedEff.wireMessage()) == timedEff && EffectiveQuality.decodeWire(legacyEffWire)?.timing == false && timedEff.wireMessage().count <= EffectiveQuality.maxWireBytes)
+    print("PASS quality request/effective JSON roundtrip (with/without virtualDisplay), bounds rejection, host resolution, scaling and UserDefaults persistence, timing/adaptive fields optional both ways")
 }
 var tailnet: TailnetHostTest?
 // Plain TCP host path with an injected authorizer standing in for `tailscale whois`.
@@ -770,7 +779,8 @@ func multiScreenTests() throws {
     let reqWire = req.wireMessage()
     require(reqWire.count <= QualityRequest.maxWireBytes && QualityRequest.decodeWire(reqWire) == req, "screens roundtrip (\(reqWire.count) bytes)")
     let twoScreens = QualityRequest(codec: .auto, chroma: .yuv420, bitrate: .auto, maxResolution: .p1080, fps: .fps30, hevcDecode: true,
-                                    virtualDisplay: VirtualDisplayRequest(enabled: false, width: 3024, height: 1890, scale: 2), screens: [cs(0, main: true, x: 0), cs(1, x: 1512)])
+                                    virtualDisplay: VirtualDisplayRequest(enabled: false, width: 3024, height: 1890, scale: 2), screens: [cs(0, main: true, x: 0), cs(1, x: 1512)],
+                                    timing: true, adaptive: true)
     require(twoScreens.wireMessage().count <= 512, "two screens fit a 0.8 host's 512-byte limit (\(twoScreens.wireMessage().count))")
     func withScreens(_ s: [ClientScreen]) -> Data { QualityRequest(codec: .auto, chroma: .yuv420, bitrate: .auto, maxResolution: .p1080, fps: .fps30, hevcDecode: true, screens: s).wireMessage() }
     var badScreen = cs(1, x: 1512); badScreen.scale = 3
@@ -898,4 +908,97 @@ func multiScreenTests() throws {
     let prefs = StreamQualityPreferences.load(d)
     require(!prefs.singleScreenVirtual && prefs.edgeReturn, "defaults: single-screen virtual off, edge return on")
     print("PASS layout memory: per host and screen signature (sizes + offsets from main), follows screens across index changes, reused by the mapping, falls back when the saved display is gone")
+}
+
+func latencyTests() throws {
+    func require(_ condition: @autoclosure () -> Bool, _ message: String, line: UInt = #line) {
+        if !condition() { print("FAIL \(message) (line \(line))"); exit(1) }
+    }
+    func noDelay(_ p: NWParameters) -> Bool { (p.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options)?.noDelay == true }
+    let listener = try plainListener(address: "127.0.0.1", port: 0)
+    require(noDelay(tlsParameters(secret: Data(repeating: 1, count: 32))) && noDelay(plainParameters()) && noDelay(listener.parameters), "TCP_NODELAY on TLS, plain dial and plain listener parameters")
+    listener.cancel()
+    print("PASS TCP_NODELAY set on TLS-PSK parameters (listener and dialer) and plain tailnet parameters (dialer and listener)")
+
+    // Keyframe policy: 0.10 viewers announce timing; 0.8 (no request) and 0.9 (no field) keep 2 s.
+    let base = QualityRequest(codec: .h264, chroma: .yuv420, bitrate: .mbps20, maxResolution: .p1080, fps: .fps30, hevcDecode: false)
+    var capable = base; capable.timing = true
+    require(EffectiveQuality.resolve(capable, hostHEVCEncode: false).timing && !EffectiveQuality.resolve(base, hostHEVCEncode: false).timing && !EffectiveQuality.legacyDefaults.timing, "timing negotiated only for 0.10 requests")
+    require(keyframeInterval(fps: 60, onDemand: false) == (120, 2) && keyframeInterval(fps: 60, onDemand: true) == (3600, 60), "interval values")
+    let q30 = EffectiveQuality(codec: .h264, chroma: .yuv420, bitrateMbps: 5, maxResolution: .p1080, fps: .fps30)
+    func keys(_ onDemand: Bool) throws -> [Int] {
+        try encodeTestFrames(width: 640, height: 360, keyframes: [], count: 70, quality: q30, onDemandKeyframes: onDemand).enumerated().compactMap { try VideoFrame.parse($1).keyframe ? $0 : nil }
+    }
+    let legacyKeys = try keys(false), onDemandKeys = try keys(true)
+    require(legacyKeys == [0, 60] && onDemandKeys == [0], "keyframes legacy \(legacyKeys) on-demand \(onDemandKeys)")
+    let forced = try encodeTestFrames(width: 640, height: 360, keyframes: [30], count: 40, quality: q30, onDemandKeyframes: true).enumerated().compactMap { try VideoFrame.parse($1).keyframe ? $0 : nil }
+    require(forced == [0, 30], "requested keyframe honoured \(forced)")
+    let v = Viewer(frame: NSRect(x: 0, y: 0, width: 640, height: 360)); var asked = 0
+    v.onNeedKeyframe = { asked += 1 }
+    let delta = try VideoFrame.parse(try encodeTestFrames(width: 640, height: 360, keyframes: [0], count: 2, quality: q30)[1])
+    require(v.show(delta) && v.show(delta) && asked == 1, "delta without decoder state asks once per 2 s (\(asked))")
+    v.requestKeyframe(now: ProcessInfo.processInfo.systemUptime + 2.1); require(asked == 2, "asks again after 2 s")
+    print("PASS keyframe policy: 30fps x 70 frames -> 0.8/0.9 viewer keyframes \(legacyKeys), 0.10 viewer \(onDemandKeys), KeyframeRequest at frame 30 -> \(forced); viewer asks once per 2 s while it lacks decoder state")
+
+    let t = FrameTiming(encodeMs: 4.26, skipped: 3, bitrateBps: 18_250_000)
+    require(t.encodeTenthsMs == 43 && t.skipped == 3 && t.bitrateTenthsMbps == 182 && FrameTiming(encodeMs: 1e9, skipped: 999, bitrateBps: 0).bytes == [255, 255, 255, 0, 1], "timing clamps")
+    let timed = try encodeTestFrames(width: 640, height: 360, keyframes: [0], count: 3, quality: q30, stream: 1, timing: t)
+    let parsed = try timed.map(VideoFrame.parse)
+    require(parsed.allSatisfy { $0.timing?.skipped == 3 && $0.timing?.bitrateTenthsMbps == 182 && $0.stream == 1 } && parsed[0].keyframe && parsed[0].parameterSets.count == 2, "encoder writes timing")
+    require(zip(parsed, timed).allSatisfy { $0.message == $1 } && timed.allSatisfy { $0[2] & 4 != 0 && $0[2] > 3 }, "timing roundtrip; flags above 3 so 0.9 parsers reject it")
+    let encodeMs = parsed.map { $0.timing!.encodeMs }
+    var legacyFrame = parsed[1]; legacyFrame.timing = nil; legacyFrame.stream = nil
+    require(legacyFrame.message[1] <= 3 && (try? VideoFrame.parse(legacyFrame.message))?.timing == nil, "no timing -> 0.9 layout")
+    let d = timed[1]
+    let badTiming: [Data] = [
+        Data(d.prefix(3)) + Data(d[3..<7]), Data(d.prefix(3)) + Data([0, 10, 0, 0, 0]) + Data(d.dropFirst(8)),
+        Data(d.prefix(2)) + Data([d[2] | 8]) + Data(d.dropFirst(3)), Data([8, 1, 4, 0, 10, 0, 0, 1]),
+        Data(d.prefix(3)) + Data(d.dropFirst(8)),
+    ]
+    for (i, m) in badTiming.enumerated() { require((try? VideoFrame.parse(m)) == nil, "bad timing message \(i) rejected") }
+    print("PASS frame timing header: encoder fills capture->encoded \(encodeMs) ms, skipped and bitrate survive the wire (5 bytes), \(badTiming.count) truncated/zero-bitrate/unknown-flag messages rejected")
+
+    let stamp: UInt64 = 0x0102030405060708
+    require(TimedPing.decode(TimedPing.ping(stamp))! == (false, stamp) && TimedPing.decode(TimedPing.pong(stamp))! == (true, stamp) && TimedPing.ping(stamp).count == 10, "ping roundtrip")
+    let zeros = { (n: Int) -> Data in Data(repeating: 0, count: n) }
+    let badPings: [Data] = [Data([3]), Data([3, 2]) + zeros(8), Data([3, 0]) + zeros(7), Data([3, 1]) + zeros(9), Data([4, 0]) + zeros(8)]
+    for bad in badPings { require(TimedPing.decode(bad) == nil, "bad ping rejected") }
+    require(TimedPing.msSince(1_000_000, now: 13_000_000) == 12 && TimedPing.msSince(2, now: 1) == nil && TimedPing.msSince(0, now: 61_000_000_000) == nil, "ping clock")
+    print("PASS timed ping/pong [3][kind][UInt64]: roundtrip, plain [3] keepalive left for 0.8/0.9 peers, wrong kind/length rejected, future/stale stamps ignored")
+
+    var c = BitrateController(ceilingBps: 20_000_000)
+    require(c.floor == 5_000_000 && BitrateController(ceilingBps: 5_000_000).floor == 2_000_000 && BitrateController(ceilingBps: 1_500_000).floor == 1_500_000, "floors")
+    var changes = 0
+    for _ in 0..<120 { if c.update(skipped: 1, sendMs: 10, rttMs: 10 + Double.random(in: 0...8), frameMs: 16.7) { changes += 1 } }
+    require(changes == 0 && c.target == 20_000_000, "steady link never changes target (\(changes))")
+    require(c.update(skipped: 3, sendMs: 10, rttMs: 10, frameMs: 16.7) && c.target == 14_000_000, "skips cut 30%")
+    require(!c.update(skipped: 5, sendMs: 10, rttMs: 10, frameMs: 16.7) && !c.update(skipped: 5, sendMs: 10, rttMs: 10, frameMs: 16.7), "2 s hold after a cut")
+    require(c.update(skipped: 0, sendMs: 10, rttMs: 45, frameMs: 16.7) && c.target == 9_800_000, "RTT rise over base+20 ms cuts")
+    var path = [c.target]
+    for _ in 0..<12 { _ = c.update(skipped: 0, sendMs: 80, rttMs: 10, frameMs: 16.7); path.append(c.target) }
+    require(c.target == 5_000_000 && path.allSatisfy { $0 >= 5_000_000 } && zip(path, path.dropFirst()).allSatisfy { $1 <= $0 }, "send latency drives down to floor, never below \(path)")
+    var calm = [Int]()
+    for _ in 0..<40 { _ = c.update(skipped: 0, sendMs: 5, rttMs: 28, frameMs: 16.7); calm.append(c.target) }
+    require(calm.prefix(4).allSatisfy { $0 == 5_000_000 } && calm[4] == 6_000_000 && c.target == 20_000_000 && calm.allSatisfy { $0 <= 20_000_000 } && zip(calm, calm.dropFirst()).allSatisfy { $1 >= $0 }, "recovers +1 Mbps/s after 5 calm s, capped \(calm)")
+    changes = 0
+    for _ in 0..<60 { if c.update(skipped: 0, sendMs: 5, rttMs: 28, frameMs: 16.7) { changes += 1 } }
+    require(changes == 0, "steady after recovery")
+    print("PASS bitrate controller 20 Mbps: floor 5 (2 for 5 Mbps), steady link 120 s unchanged, skips/RTT rise/send latency cut 30% with 2 s hold down to the floor, recovers +1 Mbps/s after 5 calm s to the ceiling and stays")
+
+    var stats = LiveStats(); stats.rttMs = 12.4
+    stats.add(FrameTiming(encodeMs: 4.2, skipped: 0, bitrateBps: 20_000_000), displayMs: 2.1); stats.add(FrameTiming(encodeMs: 3.8, skipped: 1, bitrateBps: 18_000_000), displayMs: 1.9)
+    let overlay = stats.text(fps: 60, mbps: 18.24, timing: true)
+    require(overlay == "60fps · 18.2/18Mbps · 왕복 12ms · 인코딩 4ms · 표시 2ms · 건너뜀 1" && LiveStats().text(fps: 30, mbps: 1.25, timing: false) == "30 fps  ·  1.2 Mbps", "overlay \(overlay)")
+    print("PASS overlay: \(overlay); 0.9 host keeps the fps/Mbps line")
+
+    let aspect = Viewer(frame: NSRect(x: 0, y: 0, width: 1000, height: 1000)); aspect.videoSize = CGSize(width: 2560, height: 1440); aspect.layout()
+    let r = aspect.contentRect
+    require(aspect.display.videoGravity == .resizeAspect && aspect.display.frame == r && abs(r.width / r.height - 2560.0 / 1440) < 0.001 && r.minY == 218.75, "aspect \(r)")
+    print("PASS viewer layer frame is the aspect-fit rect \(r) for 2560x1440 in 1000x1000, gravity resizeAspect")
+
+    for codec in [ResolvedCodec.h264, .hevc] where codec == .h264 || VideoEncoder.supportsHardwareHEVC {
+        let e = try VideoEncoder(width: 2560, height: 1440, quality: EffectiveQuality(codec: codec, chroma: .yuv420, bitrateMbps: 20, maxResolution: .p1440, fps: .fps60), onDemandKeyframes: true) { _ in }
+        e.setBitrate(10_000_000)
+        print("PASS \(codec.label) 1440p60 encoder: live bitrate change applied")
+    }
 }

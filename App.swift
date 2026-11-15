@@ -57,6 +57,9 @@ final class Viewer: NSView {
     var sendInput: ((InputMessage) -> Void)?
     var emergency: (() -> Void)?
     var focusChanged: (() -> Void)?
+    // Sends a KeyframeRequest for this viewer's stream (only to 0.9+ hosts, which know type 11).
+    var onNeedKeyframe: (() -> Void)?
+    private var keyframeAsked: TimeInterval?
     var tracksMouse = true
     override var acceptsFirstResponder: Bool { true }
     override var isFlipped: Bool { true }
@@ -67,11 +70,14 @@ final class Viewer: NSView {
         return NSRect(x: (bounds.width - size.width * s) / 2, y: (bounds.height - size.height * s) / 2, width: size.width * s, height: size.height * s)
     }
     // Returns false for a frame that must close the connection. Non-keyframes without a usable
-    // decoder state are skipped until the next keyframe, which the host sends at least every 2 s.
+    // decoder state are skipped until the next keyframe: a 0.10+ host sends one when asked (a 60 s
+    // safety interval otherwise), older hosts every 2 s anyway.
     func show(_ frame: VideoFrame) -> Bool {
         let renderer = display.sampleBufferRenderer
         if renderer.status == .failed { renderer.flush(); format = nil }
+        if !frame.keyframe && format == nil { requestKeyframe() }
         if frame.keyframe {
+            keyframeAsked = nil
             guard let next = videoFormat(frame) else { return false }
             if format.map({ !CMFormatDescriptionEqual($0, otherFormatDescription: next) }) ?? true {
                 format = next
@@ -82,10 +88,18 @@ final class Viewer: NSView {
         if let format, let sample = videoSample(frame, format: format) { renderer.enqueue(sample) }
         return true
     }
+    // One request per 2 s until a keyframe arrives: a large keyframe on a slow link can take over a
+    // second, and every extra request would make the host encode another one.
+    func requestKeyframe(now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        if let asked = keyframeAsked, now - asked < 2 { return }
+        keyframeAsked = now; onNeedKeyframe?()
+    }
     func clear() { format = nil; videoSize = .zero; display.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil) }
     override func layout() {
         super.layout()
-        if display.superlayer == nil { wantsLayer = true; display.videoGravity = .resize; layer?.addSublayer(display) }
+        // The layer frame is already the aspect-fit contentRect; resizeAspect also keeps the first frame
+        // of a new size undistorted until the next layout moves the frame.
+        if display.superlayer == nil { wantsLayer = true; display.videoGravity = .resizeAspect; layer?.addSublayer(display) }
         CATransaction.begin(); CATransaction.setDisableActions(true); display.frame = contentRect; CATransaction.commit()
     }
     override func draw(_ dirtyRect: NSRect) {
@@ -145,6 +159,27 @@ final class Viewer: NSView {
     }
     override func keyUp(with e: NSEvent) { sendInput?(InputMessage(kind: .keyUp, code: e.keyCode, flags: UInt64(e.modifierFlags.rawValue))) }
     override func flagsChanged(with e: NSEvent) { sendInput?(InputMessage(kind: .flags, code: e.keyCode, flags: UInt64(e.modifierFlags.rawValue))) }
+}
+// Viewer overlay numbers, summed per second. RTT is the newest timed-ping sample.
+struct LiveStats {
+    var rttMs: Double?
+    var encodeSum = 0.0, displaySum = 0.0, timed = 0, displayed = 0, skipped = 0
+    var bitrateMbps: Double?
+    mutating func add(_ t: FrameTiming, displayMs: Double?) {
+        encodeSum += t.encodeMs; timed += 1; skipped += Int(t.skipped); bitrateMbps = t.bitrateMbps
+        if let d = displayMs { displaySum += d; displayed += 1 }
+    }
+    mutating func reset() { encodeSum = 0; displaySum = 0; timed = 0; displayed = 0; skipped = 0 }
+    // e.g. "60fps · 18.2/20Mbps · 왕복 12ms · 인코딩 4ms · 표시 2ms · 건너뜀 0"; the second Mbps is the host's current target.
+    func text(fps: Int, mbps: Double, timing: Bool) -> String {
+        guard timing else { return String(format: "%d fps  ·  %.1f Mbps", fps, mbps) }
+        var parts = [String(format: "%dfps", fps), bitrateMbps.map { String(format: "%.1f/%gMbps", mbps, ($0 * 10).rounded() / 10) } ?? String(format: "%.1fMbps", mbps)]
+        if let r = rttMs { parts.append(String(format: "왕복 %.0fms", r)) }
+        if timed > 0 { parts.append(String(format: "인코딩 %.0fms", encodeSum / Double(timed))) }
+        if displayed > 0 { parts.append(String(format: "표시 %.0fms", displaySum / Double(displayed))) }
+        parts.append("건너뜀 \(skipped)")
+        return parts.joined(separator: " · ")
+    }
 }
 // One host display (or virtual display) streamed to one viewer screen.
 final class HostStream {
@@ -221,6 +256,11 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var fetching = false
     var inSession = false
     var frames = 0, bytes = 0
+    // Viewer: the host announced 0.10 timing. Per-second sums for the overlay.
+    var hostTiming = false
+    var stats = LiveStats()
+    // Host: newest RTT from a timed ping since the last per-second tick.
+    var hostRtt: Double?
     var gestureNoted = false
     var qualityWait: DispatchWorkItem?
     weak var awaitedPeer: Peer?
@@ -249,6 +289,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         buildWindow()
         viewer.sendInput = { [weak self] m in guard let data = try? JSONEncoder().encode(m) else { return }; self?.outbound?.send(Data([2]) + data) }
         viewer.emergency = { [weak self] in self?.stopAll() }
+        viewer.onNeedKeyframe = { [weak self] in self?.sendKeyframeRequest(0) }
         // First responder changes only after become/resign return, so re-evaluate afterwards.
         viewer.focusChanged = { [weak self] in DispatchQueue.main.async { self?.updateHotKeys() } }
         // Deferred: key focus moving between session screen windows is not a focus loss.
@@ -286,13 +327,17 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.stopStreams(); self.injector.release(); self.statusText = "연결 해제됨. 공유는 대기 중입니다."
         }
         host.onPacket = { [weak self] p, data in self?.hostPacket(p, data) }
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+        // Every second: keepalive (timed for 0.10 peers) and one bitrate-controller step per stream.
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             for p in self.host.peers where p.ready {
-                if Date().timeIntervalSince(p.lastReceive) > 20 { p.close() } else { p.send(Data([3])) }
+                let timed = p === self.host.active && self.streamRequest?.timing == true
+                if Date().timeIntervalSince(p.lastReceive) > 20 { p.close() } else { p.send(timed ? TimedPing.ping(TimedPing.now()) : Data([3])) }
             }
+            let rtt = self.hostRtt; self.hostRtt = nil
+            for s in self.streams { s.capture.tick(rttMs: rtt) }
             if let p = self.outbound, p.ready {
-                if Date().timeIntervalSince(p.lastReceive) > ViewerSession.silenceLimit { p.close() } else { p.send(Data([3])) }
+                if Date().timeIntervalSince(p.lastReceive) > ViewerSession.silenceLimit { p.close() } else { p.send(self.hostTiming ? TimedPing.ping(TimedPing.now()) : Data([3])) }
             }
         }
         uiTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
@@ -431,9 +476,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func tick() {
         if inSession {
             guard outbound?.ready == true else { return }
-            let text = String(format: "%d fps  ·  %.1f Mbps", frames, Double(bytes) * 8 / 1_000_000)
+            let text = stats.text(fps: frames, mbps: Double(bytes) * 8 / 1_000_000, timing: hostTiming)
             for b in boards { b.live(peer: peerName, metrics: text) }
-            frames = 0; bytes = 0
+            frames = 0; bytes = 0; stats.reset()
         } else if window.isVisible {
             if content.current == 0 { computers.refreshPermissions() }
             if content.current == 2 { settings.refreshPermissions() }
@@ -444,7 +489,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return devices.first { $0.ips.contains(h) }?.name ?? h
     }
     func enterSession() {
-        frames = 0; bytes = 0
+        frames = 0; bytes = 0; stats = LiveStats()
         if !inSession {
             inSession = true; settings.stopRecording()
             sessionView.setQuality("")
@@ -480,6 +525,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let screens = Array(NSScreen.screens.prefix(maxScreenStreams))
         for (i, screen) in screens.enumerated() where clientScreens.indices.contains(i) {
             let viewer = Viewer(); viewer.tracksMouse = false
+            viewer.onNeedKeyframe = { [weak self] in self?.sendKeyframeRequest(i) }
             let view = SessionView(viewer: viewer); view.tracksMouse = false
             viewer.topAnchor.constraint(equalTo: view.topAnchor).isActive = true
             view.fullScreen.title = "창으로 보기"; view.fullScreen.target = self; view.fullScreen.action = #selector(toggleFullScreen)
@@ -540,9 +586,12 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.hide(nil)
     }
     func requestKeyframes() {
+        for v in presentation == .screens ? remoteScreens.map(\.viewer) : [viewer] { v.requestKeyframe() }
+    }
+    // 0.8 hosts send no ScreenMap and would close on type 11.
+    func sendKeyframeRequest(_ id: Int) {
         guard screenMap != nil else { return }
-        let ids = presentation == .screens ? remoteScreens.map(\.id) : [0]
-        for id in ids { outbound?.send(KeyframeRequest.wire(id)) }
+        outbound?.send(KeyframeRequest.wire(id))
     }
     func refreshMonitorMenus() {
         guard let map = screenMap else { for b in boards { b.setMonitors([], current: nil) }; return }
@@ -825,6 +874,11 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func hostPacket(_ p: Peer, _ data: Data) {
         if data == Data([3]) { return }
+        if data.first == 3 {
+            guard let ping = TimedPing.decode(data) else { p.close(); return }
+            if ping.pong { hostRtt = TimedPing.msSince(ping.time) ?? hostRtt } else { p.send(TimedPing.pong(ping.time)) }
+            return
+        }
         if data.first == QualityRequest.messageType {
             guard awaitedPeer === p, streams.isEmpty, let req = QualityRequest.decodeWire(data) else { p.close(); return }
             qualityWait?.cancel(); qualityWait = nil; awaitedPeer = nil
@@ -870,10 +924,11 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func dial() {
         guard let t = session.target else { return }
-        let p = Peer(NWConnection(host: NWEndpoint.Host(t.host), port: NWEndpoint.Port(rawValue: t.port)!, using: t.secret.map(tlsParameters) ?? .tcp), greet: t.secret == nil)
+        let p = Peer(NWConnection(host: NWEndpoint.Host(t.host), port: NWEndpoint.Port(rawValue: t.port)!, using: t.secret.map(tlsParameters) ?? plainParameters()), greet: t.secret == nil)
         outbound = p
         p.onReady = { [weak self, weak p] in
             guard let self, let p else { return }
+            self.hostTiming = false
             let prefs = StreamQualityPreferences.load()
             // A redial keeps the screens the session windows were built for.
             if !self.inSession { self.clientScreens = ClientScreen.list(NSScreen.screens); self.layoutHost = self.peerName }
@@ -890,8 +945,14 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         p.onPacket = { [weak self, weak p] data in
             if data == Data([3]) { return }
             guard let self = self else { return }
+            if data.first == 3 {
+                guard let ping = TimedPing.decode(data) else { p?.close(); return }
+                if ping.pong { self.stats.rttMs = TimedPing.msSince(ping.time) ?? self.stats.rttMs } else { p?.send(TimedPing.pong(ping.time)) }
+                return
+            }
             if data.first == EffectiveQuality.messageType {
                 guard let eff = EffectiveQuality.decodeWire(data) else { p?.close(); return }
+                self.hostTiming = eff.timing
                 for b in self.boards { b.setQuality(eff.summary) }
                 self.settings.setLastEffective(eff.summary)
                 return
@@ -921,6 +982,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             case .local: target = nil
             }
             if let target, !target.show(frame) { p?.close(); return }
+            if let t = frame.timing { self.stats.add(t, displayMs: target == nil ? nil : TimedPing.msSince(p?.packetStart ?? 0)) }
             if id == 0 { self.frames += 1 }
             self.bytes += data.count
         }

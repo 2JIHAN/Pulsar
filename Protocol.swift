@@ -147,10 +147,18 @@ func tlsParameters(secret: Data) -> NWParameters {
     let identity = Data("RemoteControl-v1".utf8).withUnsafeBytes { DispatchData(bytes: $0) }
     sec_protocol_options_add_pre_shared_key(options, key as __DispatchData, identity as __DispatchData)
     sec_protocol_options_set_tls_tickets_enabled(options, false)
-    let p = NWParameters(tls: tls, tcp: NWProtocolTCP.Options())
+    let p = NWParameters(tls: tls, tcp: tcpOptions())
     p.allowLocalEndpointReuse = true
     return p
 }
+// Nagle would hold the tail of each frame and small input/ping packets until the previous
+// segment is acknowledged, adding up to one round trip per frame.
+func tcpOptions() -> NWProtocolTCP.Options {
+    let t = NWProtocolTCP.Options()
+    t.noDelay = true
+    return t
+}
+func plainParameters() -> NWParameters { NWParameters(tls: nil, tcp: tcpOptions()) }
 // Same-account Macs connect over Tailscale without TLS: WireGuard already encrypts and
 // authenticates each node, and the host checks the source IP's owner with `tailscale whois`.
 let tailnetPort: UInt16 = 47700
@@ -162,7 +170,7 @@ func tailnetBindAddress(_ ips: [String]) -> String? {
     }
 }
 func plainListener(address: String, port: UInt16) throws -> NWListener {
-    let p = NWParameters.tcp
+    let p = plainParameters()
     p.allowLocalEndpointReuse = true
     p.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(address), port: NWEndpoint.Port(rawValue: port) ?? .any)
     return try NWListener(using: p)
@@ -238,6 +246,9 @@ final class Peer {
     var ready = false
     var closed = false
     var lastReceive = Date()
+    // Uptime (ns) when the first byte of the packet being delivered to onPacket arrived, so a large
+    // frame's receive time includes its transfer, not just the last chunk.
+    private(set) var packetStart: UInt64 = 0
     var pendingControl = 0
     // Plain TCP is "ready" as soon as a SYN completes, which a port probe also does, so both
     // ends exchange a hello first and only then count as ready.
@@ -273,15 +284,19 @@ final class Peer {
             guard let self = self, !self.closed else { return }
             if let data = data, !data.isEmpty {
                 self.lastReceive = Date()
+                let now = TimedPing.now()
+                var start = self.parser.buffer.isEmpty ? now : self.packetStart
                 do {
                     for packet in try self.parser.feed(data) {
                         guard !self.closed else { return }
+                        self.packetStart = start; start = now
                         if !self.ready {
                             guard packet == Self.hello else { self.close(); return }
                             self.ready = true; self.onReady?(); continue
                         }
                         self.onPacket?(packet)
                     }
+                    self.packetStart = start
                 }
                 catch { self.close(); return }
             }
@@ -491,6 +506,7 @@ struct StreamQualityPreferences: Equatable {
     var fps: FPSOption = .fps30
     var singleScreenVirtual: Bool = false
     var edgeReturn: Bool = true
+    var adaptiveBitrate: Bool = true
 
     private static let codecKey = "quality.codec"
     private static let chromaKey = "quality.chroma"
@@ -500,6 +516,7 @@ struct StreamQualityPreferences: Equatable {
     // A new key: 0.8 saved the old default (on) whenever any quality control changed.
     private static let virtualDisplayKey = "quality.singleScreenVirtual"
     private static let edgeReturnKey = "session.edgeReturn"
+    private static let adaptiveKey = "quality.adaptiveBitrate"
 
     static func load(_ d: UserDefaults = .standard) -> StreamQualityPreferences {
         var p = StreamQualityPreferences()
@@ -510,6 +527,7 @@ struct StreamQualityPreferences: Equatable {
         if d.object(forKey: fpsKey) != nil, let v = FPSOption(rawValue: d.integer(forKey: fpsKey)) { p.fps = v }
         if d.object(forKey: virtualDisplayKey) != nil { p.singleScreenVirtual = d.bool(forKey: virtualDisplayKey) }
         if d.object(forKey: edgeReturnKey) != nil { p.edgeReturn = d.bool(forKey: edgeReturnKey) }
+        if d.object(forKey: adaptiveKey) != nil { p.adaptiveBitrate = d.bool(forKey: adaptiveKey) }
         return p
     }
     func save(_ d: UserDefaults = .standard) {
@@ -520,9 +538,11 @@ struct StreamQualityPreferences: Equatable {
         d.set(fps.rawValue, forKey: Self.fpsKey)
         d.set(singleScreenVirtual, forKey: Self.virtualDisplayKey)
         d.set(edgeReturn, forKey: Self.edgeReturnKey)
+        d.set(adaptiveBitrate, forKey: Self.adaptiveKey)
     }
     func request(hevcDecode: Bool, virtualDisplay: VirtualDisplayRequest? = nil, screens: [ClientScreen]? = nil) -> QualityRequest {
-        QualityRequest(codec: codec, chroma: codec == .h264 ? .yuv420 : chroma, bitrate: bitrate, maxResolution: maxResolution, fps: fps, hevcDecode: hevcDecode, virtualDisplay: virtualDisplay, screens: screens)
+        QualityRequest(codec: codec, chroma: codec == .h264 ? .yuv420 : chroma, bitrate: bitrate, maxResolution: maxResolution, fps: fps, hevcDecode: hevcDecode, virtualDisplay: virtualDisplay, screens: screens,
+                       timing: true, adaptive: adaptiveBitrate)
     }
 }
 
@@ -686,13 +706,35 @@ struct ScreenSwitch: Codable, Equatable {
         return s
     }
 }
-// Viewer -> host: [11][stream]. Sent when a hidden screen becomes visible again.
+// Viewer -> host: [11][stream]. Sent when a hidden screen becomes visible again and, from 0.10, whenever
+// the viewer has no usable decoder state (renderer failed, or a delta frame arrived before a keyframe).
 enum KeyframeRequest {
     static let messageType: UInt8 = 11
     static func wire(_ stream: Int) -> Data { Data([messageType, UInt8(stream)]) }
     static func decode(_ data: Data) -> Int? {
         guard data.count == 2, data.first == messageType, Int(data[data.startIndex + 1]) < maxScreenStreams else { return nil }
         return Int(data[data.startIndex + 1])
+    }
+}
+
+// Type 3 is the keepalive. Older peers send and expect exactly [3]; peers that both announced `timing`
+// also send [3][0][UInt64 BE sender uptime ns] and answer with the same bytes and kind 1, so the
+// sender measures a round trip on its own clock. It rides behind video in the same TCP stream, so it
+// includes queueing, which is what the bitrate controller needs to see.
+enum TimedPing {
+    static func ping(_ t: UInt64) -> Data { wire(kind: 0, t) }
+    static func pong(_ t: UInt64) -> Data { wire(kind: 1, t) }
+    private static func wire(kind: UInt8, _ t: UInt64) -> Data { Data([3, kind]) + withUnsafeBytes(of: t.bigEndian) { Data($0) } }
+    static func decode(_ data: Data) -> (pong: Bool, time: UInt64)? {
+        let b = [UInt8](data)
+        guard b.count == 10, b[0] == 3, b[1] <= 1 else { return nil }
+        return (b[1] == 1, b[2...].reduce(UInt64(0)) { ($0 << 8) | UInt64($1) })
+    }
+    static func now() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+    // Milliseconds since an uptime stamp; nil for one from the future or older than a minute.
+    static func msSince(_ t: UInt64, now: UInt64 = now()) -> Double? {
+        guard t <= now, now - t < 60_000_000_000 else { return nil }
+        return Double(now - t) / 1_000_000
     }
 }
 
@@ -732,6 +774,11 @@ struct QualityRequest: Codable, Equatable {
     var hevcDecode: Bool
     var virtualDisplay: VirtualDisplayRequest? = nil
     var screens: [ClientScreen]? = nil
+    // 0.10 viewers set `timing`: they read frame timing headers, answer timed pings and ask for a
+    // keyframe whenever they lose decoder state, so the host may stop periodic keyframes.
+    // `adaptive` lets the host lower the bitrate below `bitrate` on a congested link. Older viewers omit both.
+    var timing: Bool? = nil
+    var adaptive: Bool? = nil
 
     func wireMessage() -> Data {
         let json = (try? JSONEncoder().encode(self)) ?? Data()
@@ -755,18 +802,21 @@ struct EffectiveQuality: Codable, Equatable {
     var maxResolution: MaxResolutionOption
     var fps: FPSOption
     var virtualDisplay: Bool = false
+    // The host honours the viewer's `timing`: frames carry FrameTiming and timed pings are answered.
+    var timing: Bool = false
 
     enum CodingKeys: String, CodingKey {
-        case codec, chroma, bitrateMbps, maxResolution, fps, virtualDisplay
+        case codec, chroma, bitrateMbps, maxResolution, fps, virtualDisplay, timing
     }
 
-    init(codec: ResolvedCodec, chroma: ChromaOption, bitrateMbps: Int, maxResolution: MaxResolutionOption, fps: FPSOption, virtualDisplay: Bool = false) {
+    init(codec: ResolvedCodec, chroma: ChromaOption, bitrateMbps: Int, maxResolution: MaxResolutionOption, fps: FPSOption, virtualDisplay: Bool = false, timing: Bool = false) {
         self.codec = codec
         self.chroma = chroma
         self.bitrateMbps = bitrateMbps
         self.maxResolution = maxResolution
         self.fps = fps
         self.virtualDisplay = virtualDisplay
+        self.timing = timing
     }
 
     init(from decoder: Decoder) throws {
@@ -777,6 +827,7 @@ struct EffectiveQuality: Codable, Equatable {
         maxResolution = try c.decode(MaxResolutionOption.self, forKey: .maxResolution)
         fps = try c.decode(FPSOption.self, forKey: .fps)
         virtualDisplay = try c.decodeIfPresent(Bool.self, forKey: .virtualDisplay) ?? false
+        timing = try c.decodeIfPresent(Bool.self, forKey: .timing) ?? false
     }
 
     static let legacyDefaults = EffectiveQuality(codec: .h264, chroma: .yuv420, bitrateMbps: 8, maxResolution: .p1080, fps: .fps30)
@@ -792,7 +843,7 @@ struct EffectiveQuality: Codable, Equatable {
         let resolvedCodec: ResolvedCodec = (req.codec != .h264 && canHEVC) ? .hevc : .h264
         let resolvedChroma: ChromaOption = (resolvedCodec == .hevc && req.chroma == .yuv444 && hostHEVC444Encode) ? .yuv444 : .yuv420
         let mbps = BitrateOption.allowedMbps.contains(req.bitrate.mbps) ? req.bitrate.mbps : 8
-        return EffectiveQuality(codec: resolvedCodec, chroma: resolvedChroma, bitrateMbps: mbps, maxResolution: req.maxResolution, fps: req.fps, virtualDisplay: virtualDisplay)
+        return EffectiveQuality(codec: resolvedCodec, chroma: resolvedChroma, bitrateMbps: mbps, maxResolution: req.maxResolution, fps: req.fps, virtualDisplay: virtualDisplay, timing: req.timing ?? false)
     }
 
     func wireMessage() -> Data {
@@ -808,19 +859,36 @@ struct EffectiveQuality: Codable, Equatable {
     }
 }
 
-// Message type 4: [4][flags: bit 0 = keyframe, bit 1 = HEVC][keyframe only: UInt16 BE length + parameter sets (H.264: SPS,PPS; HEVC: VPS,SPS,PPS)]
+// Message type 4: [4][flags: bit 0 = keyframe, bit 1 = HEVC, bit 2 = timing][timing only: 5 bytes FrameTiming][keyframe only: UInt16 BE length + parameter sets (H.264: SPS,PPS; HEVC: VPS,SPS,PPS)]
 // [one access unit as AVCC/HVCC NAL units, each prefixed by a UInt32 BE length].
 // Message type 8 is the same with a stream byte (viewer screen id, 0...3) before the flags; only sent to
 // viewers that listed their screens, so 0.8 viewers keep receiving type 4.
+// The timing bit is only set for viewers that announced `timing`; 0.8/0.9 parsers reject flags above 3.
+// FrameTiming: [UInt16 BE capture->encoded in 0.1 ms][UInt8 frames skipped since the previous frame][UInt16 BE target bitrate in 0.1 Mbps].
+struct FrameTiming: Equatable {
+    var encodeTenthsMs: UInt16
+    var skipped: UInt8
+    var bitrateTenthsMbps: UInt16
+    init(encodeMs: Double, skipped: Int, bitrateBps: Int) {
+        encodeTenthsMs = UInt16(min(65535, max(0, (encodeMs * 10).rounded())))
+        self.skipped = UInt8(min(255, max(0, skipped)))
+        bitrateTenthsMbps = UInt16(min(65535, max(1, bitrateBps / 100_000)))
+    }
+    var encodeMs: Double { Double(encodeTenthsMs) / 10 }
+    var bitrateMbps: Double { Double(bitrateTenthsMbps) / 10 }
+    var bytes: [UInt8] { [UInt8(encodeTenthsMs >> 8), UInt8(encodeTenthsMs & 0xff), skipped, UInt8(bitrateTenthsMbps >> 8), UInt8(bitrateTenthsMbps & 0xff)] }
+}
 struct VideoFrame: Equatable {
     var codec: ResolvedCodec = .h264
     var keyframe: Bool
     var parameterSets: [Data]
     var avcc: Data
     var stream: UInt8? = nil
+    var timing: FrameTiming? = nil
     var message: Data {
-        let flags: UInt8 = (keyframe ? 1 : 0) | (codec == .hevc ? 2 : 0)
+        let flags: UInt8 = (keyframe ? 1 : 0) | (codec == .hevc ? 2 : 0) | (timing == nil ? 0 : 4)
         var data = stream.map { Data([8, $0, flags]) } ?? Data([4, flags])
+        if let timing { data += timing.bytes }
         for p in parameterSets { data += [UInt8(p.count >> 8), UInt8(p.count & 0xff)] + p }
         return data + avcc
     }
@@ -829,10 +897,18 @@ struct VideoFrame: Equatable {
         guard b.count >= 7, b.count <= PacketParser.limit, b[0] == 4 || b[0] == 8 else { throw WireError.invalid }
         let stream: UInt8? = b[0] == 8 ? b[1] : nil
         let f = stream == nil ? 1 : 2
-        guard b.count >= f + 6, (stream ?? 0) < UInt8(maxScreenStreams), b[f] <= 3 else { throw WireError.invalid }
+        guard b.count >= f + 6, (stream ?? 0) < UInt8(maxScreenStreams), b[f] <= 7 else { throw WireError.invalid }
         let keyframe = (b[f] & 1) != 0
         let codec: ResolvedCodec = (b[f] & 2) != 0 ? .hevc : .h264
         var i = f + 1
+        var timing: FrameTiming?
+        if (b[f] & 4) != 0 {
+            guard b.count >= i + 5 + 5 else { throw WireError.invalid }
+            var t = FrameTiming(encodeMs: 0, skipped: 0, bitrateBps: 0)
+            t.encodeTenthsMs = UInt16(b[i]) << 8 | UInt16(b[i + 1]); t.skipped = b[i + 2]; t.bitrateTenthsMbps = UInt16(b[i + 3]) << 8 | UInt16(b[i + 4])
+            guard t.bitrateTenthsMbps > 0 else { throw WireError.invalid }
+            timing = t; i += 5
+        }
         var parameterSets = [Data]()
         if keyframe {
             let expectedTypes: [UInt8] = codec == .hevc ? [32, 33, 34] : [7, 8]
@@ -856,11 +932,11 @@ struct VideoFrame: Equatable {
             guard n > 0, n <= b.count - i, units <= 256 else { throw WireError.invalid }
             i += n
         }
-        return VideoFrame(codec: codec, keyframe: keyframe, parameterSets: parameterSets, avcc: Data(b[start...]), stream: stream)
+        return VideoFrame(codec: codec, keyframe: keyframe, parameterSets: parameterSets, avcc: Data(b[start...]), stream: stream, timing: timing)
     }
 }
 // Encoder output -> wire message. Returns nil for anything the viewer parser would reject.
-func videoMessage(_ sample: CMSampleBuffer, codec: ResolvedCodec = .h264, stream: UInt8? = nil) -> Data? {
+func videoMessage(_ sample: CMSampleBuffer, codec: ResolvedCodec = .h264, stream: UInt8? = nil, timing: FrameTiming? = nil) -> Data? {
     guard let block = CMSampleBufferGetDataBuffer(sample), let format = CMSampleBufferGetFormatDescription(sample) else { return nil }
     let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[CFString: Any]]
     let keyframe = attachments?.first?[kCMSampleAttachmentKey_NotSync] as? Bool != true
@@ -888,7 +964,7 @@ func videoMessage(_ sample: CMSampleBuffer, codec: ResolvedCodec = .h264, stream
     guard length > 0, length <= PacketParser.limit else { return nil }
     var avcc = Data(count: length)
     guard avcc.withUnsafeMutableBytes({ CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!) }) == noErr else { return nil }
-    let message = VideoFrame(codec: codec, keyframe: keyframe, parameterSets: parameterSets, avcc: avcc, stream: stream).message
+    let message = VideoFrame(codec: codec, keyframe: keyframe, parameterSets: parameterSets, avcc: avcc, stream: stream, timing: timing).message
     return (try? VideoFrame.parse(message)) == nil ? nil : message
 }
 // Validates dimensions from the SPS before anything is decoded.

@@ -561,6 +561,7 @@ final class SettingsPage: NSObject {
     let fpsControl = NSSegmentedControl(labels: ["30 fps", "60 fps"], trackingMode: .selectOne, target: nil, action: nil)
     let virtualDisplaySwitch = NSSwitch()
     let edgeReturnSwitch = NSSwitch()
+    let adaptiveSwitch = NSSwitch()
     let qualityNote = label("최근 연결: 없음", 11, .regular, Palette.secondary)
     private var lastEffective: String?
     private var isConnected = false
@@ -600,14 +601,15 @@ final class SettingsPage: NSObject {
         codecPopup.addItems(withTitles: ["자동", "H.264", "HEVC (H.265)"])
         bitratePopup.addItems(withTitles: ["자동 (8 Mbps)", "5 Mbps", "10 Mbps", "20 Mbps", "35 Mbps", "50 Mbps"])
         resolutionPopup.addItems(withTitles: ["1080p (1920×1080)", "1440p (2560×1440)", "원본 (최대 3840×2400)"])
-        for c in [codecPopup, bitratePopup, resolutionPopup, virtualDisplaySwitch, edgeReturnSwitch] as [NSControl] { c.target = self; c.action = #selector(qualityChanged) }
+        for c in [codecPopup, bitratePopup, adaptiveSwitch, resolutionPopup, virtualDisplaySwitch, edgeReturnSwitch] as [NSControl] { c.target = self; c.action = #selector(qualityChanged) }
         for c in [chromaControl, fpsControl] as [NSSegmentedControl] { c.target = self; c.action = #selector(qualityChanged) }
         syncQualityControls()
         qualityNote.lineBreakMode = .byWordWrapping; qualityNote.maximumNumberOfLines = 0
         let qualityRows = [
             settingRow("코덱", "자동은 양쪽 Mac이 하드웨어 HEVC를 지원할 때 HEVC를 사용합니다.", [codecPopup]),
             settingRow("색상", "선명한 글자(4:4:4)는 HEVC에서만 활성화되며, 미지원 시 4:2:0으로 적용됩니다.", [chromaControl]),
-            settingRow("비트레이트", "화면마다 적용합니다. 최대 대역폭은 평균의 1.5배로 제한합니다.", [bitratePopup]),
+            settingRow("비트레이트", "화면마다 적용하는 최대값입니다. 순간 대역폭은 평균의 1.5배로 제한합니다.", [bitratePopup]),
+            settingRow("네트워크에 맞춰 화질 자동 조절", "네트워크가 느려지면 비트레이트를 잠시 낮춰 화면이 밀리지 않게 하고, 나아지면 설정값까지 다시 올립니다.", [adaptiveSwitch]),
             settingRow("최대 해상도", "호스트 기본 해상도를 짝수 크기와 비율을 유지해 축소합니다.", [resolutionPopup]),
             settingRow("프레임", "60 fps는 화면이 부드럽지만 더 많은 대역폭을 사용합니다.", [fpsControl]),
             settingRow("화면이 하나일 때 가상 화면 사용", "이 Mac의 화면이 하나일 때 상대 Mac에 이 화면 크기의 가상 화면을 만들어 보여 줍니다. 끄면 상대 Mac의 기본 화면을 보여 줍니다.", [virtualDisplaySwitch]),
@@ -645,6 +647,7 @@ final class SettingsPage: NSObject {
         fpsControl.selectedSegment = FPSOption.allCases.firstIndex(of: prefs.fps) ?? 0
         virtualDisplaySwitch.state = prefs.singleScreenVirtual ? .on : .off
         edgeReturnSwitch.state = prefs.edgeReturn ? .on : .off
+        adaptiveSwitch.state = prefs.adaptiveBitrate ? .on : .off
         updateChromaState(savedChroma: prefs.chroma)
     }
     private func updateChromaState(savedChroma: ChromaOption) {
@@ -661,6 +664,7 @@ final class SettingsPage: NSObject {
         prefs.fps = FPSOption.allCases[max(0, fpsControl.selectedSegment)]
         prefs.singleScreenVirtual = virtualDisplaySwitch.state == .on
         prefs.edgeReturn = edgeReturnSwitch.state == .on
+        prefs.adaptiveBitrate = adaptiveSwitch.state == .on
         if sender === chromaControl {
             prefs.chroma = chromaControl.selectedSegment == 1 ? .yuv444 : .yuv420
         }

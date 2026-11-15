@@ -3,6 +3,47 @@ import ScreenCaptureKit
 import VideoToolbox
 import ApplicationServices
 
+// Periodic keyframes cost 25-100 P-frames each (measured: ~0.6-0.8 MB vs 8-33 KB at 1440p60 20 Mbps),
+// a burst every interval that queues behind itself on a slow link. A 0.10 viewer asks for one when it
+// needs it, so it only gets a 60 s safety keyframe that bounds any corruption nobody detected.
+// 0.8/0.9 viewers never ask after a renderer failure, so they keep the 2 s interval.
+func keyframeInterval(fps: Int, onDemand: Bool) -> (frames: Int, seconds: Int) {
+    onDemand ? (fps * 60, 60) : (fps * 2, 2)
+}
+enum EncodedFrame { case message(Data), dropped, failed }
+// Pure, called once per second per stream. Ceiling is the user's 비트레이트 setting.
+// Congestion: frames skipped because two were already in flight, encoder-output -> send-done time
+// over three frame intervals, or RTT above the 30 s minimum by max(20 ms, that minimum).
+// Congestion cuts 30% (then holds 2 s so the queue can drain); 5 calm seconds start +5% of the ceiling per second.
+struct BitrateController {
+    let ceiling: Int, floor: Int
+    private(set) var target: Int
+    private var calm = 0, hold = 0
+    private var rtts = [Double]()
+    init(ceilingBps: Int) {
+        ceiling = ceilingBps; floor = min(ceilingBps, max(2_000_000, ceilingBps / 4)); target = ceilingBps
+    }
+    // Returns true when the target changed.
+    mutating func update(skipped: Int, sendMs: Double?, rttMs: Double?, frameMs: Double) -> Bool {
+        var rttRise = false
+        if let r = rttMs {
+            rtts.append(r); if rtts.count > 30 { rtts.removeFirst() }
+            let base = rtts.min()!
+            rttRise = r > base + max(20, base)
+        }
+        let congested = skipped >= 2 || rttRise || (sendMs ?? 0) > 3 * frameMs
+        let old = target, held = hold > 0
+        if held { hold -= 1 }
+        if congested {
+            calm = 0
+            if !held { target = max(floor, Int(Double(target) * 0.7)); hold = 2 }
+        } else {
+            calm += 1
+            if calm >= 5 { target = min(ceiling, target + max(250_000, ceiling / 20)) }
+        }
+        return target != old
+    }
+}
 final class VideoEncoder {
     static let supportsHardwareHEVC: Bool = {
         var created: VTCompressionSession?
@@ -15,10 +56,12 @@ final class VideoEncoder {
     private let session: VTCompressionSession
     let effectiveQuality: EffectiveQuality
     private let stream: UInt8?
-    private let onOutput: (Data?) -> Void
+    private let onOutput: (EncodedFrame) -> Void
 
-    private static func makeSession(width: Int, height: Int, quality: EffectiveQuality) -> VTCompressionSession? {
+    private static func makeSession(width: Int, height: Int, quality: EffectiveQuality, onDemandKeyframes: Bool) -> VTCompressionSession? {
         var created: VTCompressionSession?
+        // Not low-latency rate control: measured at 1440p60 5 Mbps it dropped 184-186 of 300 frames
+        // (normal control dropped none) for under 1 ms of encode time, which fights the adaptive bitrate.
         let spec = [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true] as CFDictionary
         let codec: CMVideoCodecType = quality.codec == .hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264
         let imageAttrs: CFDictionary? = (quality.codec == .hevc && quality.chroma == .yuv444)
@@ -31,6 +74,7 @@ final class VideoEncoder {
         let avgBitrate = quality.bitrateMbps * 1_000_000
         let peakBytesPerSecond = quality.bitrateMbps * 187_500 // 1.5x average in bytes/sec
         let fps = quality.fps.rawValue
+        let keyframes = keyframeInterval(fps: fps, onDemand: onDemandKeyframes)
         let properties: [CFString: Any] = [
             kVTCompressionPropertyKey_RealTime: true,
             kVTCompressionPropertyKey_AllowFrameReordering: false,
@@ -38,8 +82,8 @@ final class VideoEncoder {
             kVTCompressionPropertyKey_AverageBitRate: avgBitrate,
             kVTCompressionPropertyKey_DataRateLimits: [peakBytesPerSecond, 1],
             kVTCompressionPropertyKey_ExpectedFrameRate: fps,
-            kVTCompressionPropertyKey_MaxKeyFrameInterval: fps * 2,
-            kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: 2,
+            kVTCompressionPropertyKey_MaxKeyFrameInterval: keyframes.frames,
+            kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: keyframes.seconds,
         ]
         guard VTSessionSetProperties(session, propertyDictionary: properties as CFDictionary) == noErr, VTCompressionSessionPrepareToEncodeFrames(session) == noErr else {
             VTCompressionSessionInvalidate(session)
@@ -48,13 +92,17 @@ final class VideoEncoder {
         return session
     }
 
-    // onOutput runs on a VideoToolbox thread with a wire message, or nil when the frame was dropped.
-    init(width: Int, height: Int, quality: EffectiveQuality = .legacyDefaults, stream: UInt8? = nil, onOutput: @escaping (Data?) -> Void) throws {
+    // onOutput runs on a VideoToolbox thread. `.dropped` is a frame the rate controller skipped, which
+    // leaves the reference chain intact; `.failed` means the viewer needs a keyframe.
+    init(width: Int, height: Int, quality: EffectiveQuality = .legacyDefaults, stream: UInt8? = nil, onDemandKeyframes: Bool = false, onOutput: @escaping (EncodedFrame) -> Void) throws {
         var resolved = quality
-        var created = Self.makeSession(width: width, height: height, quality: resolved)
+        func make(_ q: EffectiveQuality) -> VTCompressionSession? {
+            Self.makeSession(width: width, height: height, quality: q, onDemandKeyframes: onDemandKeyframes)
+        }
+        var created = make(resolved)
         if created == nil, resolved.codec == .hevc && resolved.chroma == .yuv444 {
             resolved.chroma = .yuv420
-            created = Self.makeSession(width: width, height: height, quality: resolved)
+            created = make(resolved)
         }
         guard let session = created else { throw WireError.invalid }
         self.session = session
@@ -63,13 +111,29 @@ final class VideoEncoder {
         self.onOutput = onOutput
     }
     deinit { VTCompressionSessionInvalidate(session) }
-    func encode(_ pixel: CVImageBuffer, time: CMTime, keyframe: Bool) -> Bool {
+    // Live change; both properties are accepted mid-session (measured, output follows within a second).
+    func setBitrate(_ bps: Int) {
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bps as CFNumber)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: [bps * 3 / 16, 1] as CFArray)
+    }
+    // `timing` (without the encode time) goes into the frame for 0.10 viewers; `capturedAt` is mach host time.
+    func encode(_ pixel: CVImageBuffer, time: CMTime, keyframe: Bool, timing: FrameTiming? = nil, capturedAt: UInt64 = 0) -> Bool {
         let options = keyframe ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
         let codec = effectiveQuality.codec, stream = stream
-        return VTCompressionSessionEncodeFrame(session, imageBuffer: pixel, presentationTimeStamp: time, duration: .invalid, frameProperties: options, infoFlagsOut: nil) { [onOutput] status, _, sample in
-            onOutput(status == noErr ? sample.flatMap { videoMessage($0, codec: codec, stream: stream) } : nil)
+        return VTCompressionSessionEncodeFrame(session, imageBuffer: pixel, presentationTimeStamp: time, duration: .invalid, frameProperties: options, infoFlagsOut: nil) { [onOutput] status, flags, sample in
+            guard status == noErr else { onOutput(.failed); return }
+            // A frame the encoder drops arrives with .frameDropped; a 0.10 viewer re-asks for a keyframe after 2 s if needed.
+            guard let sample else { onOutput(flags.contains(.frameDropped) ? .dropped : .failed); return }
+            var t = timing
+            t?.encodeTenthsMs = FrameTiming(encodeMs: hostTimeMs(since: capturedAt), skipped: 0, bitrateBps: 0).encodeTenthsMs
+            onOutput(videoMessage(sample, codec: codec, stream: stream, timing: t).map { .message($0) } ?? .failed)
         } == noErr
     }
+}
+private let hostTimebase: mach_timebase_info_data_t = { var t = mach_timebase_info_data_t(); mach_timebase_info(&t); return t }()
+func hostTimeMs(since start: UInt64, now: UInt64 = mach_absolute_time()) -> Double {
+    guard start > 0, now > start else { return 0 }
+    return Double(now - start) * Double(hostTimebase.numer) / Double(hostTimebase.denom) / 1_000_000
 }
 final class VirtualDisplay {
     static var isAvailable: Bool { PulsarVirtualDisplayAPIAvailable() }
@@ -128,7 +192,24 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
     // because dropping an encoded frame would break the decoder's reference chain.
     private var inFlight = 0
     private var needsKeyframe = true
+    // Owned by queue. `timing`: the viewer announced 0.10 timing support. `bitrate` is nil when the
+    // viewer turned automatic adjustment off or is older than 0.10.
+    private var timing = false
+    private var bitrate: BitrateController?
+    private var ceilingBps = 0, fps = 30
+    private var skippedSinceFrame = 0, skippedThisSecond = 0
+    private var sendMsSum = 0.0, sendCount = 0
     func requestKeyframe() { queue.async { self.needsKeyframe = true } }
+    // Called once per second on main with the newest timed-ping RTT, if one arrived.
+    func tick(rttMs: Double?) {
+        queue.async {
+            let skipped = self.skippedThisSecond, send = self.sendCount > 0 ? self.sendMsSum / Double(self.sendCount) : nil
+            self.skippedThisSecond = 0; self.sendMsSum = 0; self.sendCount = 0
+            if self.bitrate?.update(skipped: skipped, sendMs: send, rttMs: rttMs, frameMs: 1000 / Double(self.fps)) == true, let b = self.bitrate {
+                self.encoder?.setBitrate(b.target)
+            }
+        }
+    }
     // `targetDisplayID` nil captures the main display. A virtual target may need a moment to report its mode.
     @MainActor func start(request: QualityRequest? = nil, targetDisplayID: CGDirectDisplayID? = nil, isVirtual: Bool = false, fallbackPixelSize: (Int, Int)? = nil) async throws -> EffectiveQuality {
         guard !stopped else { throw WireError.invalid }
@@ -168,7 +249,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         outputSize = scaled
 
         func startWith(_ quality: EffectiveQuality) async throws -> EffectiveQuality {
-            let encoder = try VideoEncoder(width: scaled.width, height: scaled.height, quality: quality, stream: streamIndex) { [weak self] message in self?.deliver(message) }
+            let encoder = try VideoEncoder(width: scaled.width, height: scaled.height, quality: quality, stream: streamIndex, onDemandKeyframes: quality.timing) { [weak self] out in self?.deliver(out) }
             let actual = encoder.effectiveQuality
             let config = SCStreamConfiguration()
             config.width = scaled.width
@@ -176,7 +257,13 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
             config.pixelFormat = actual.chroma == .yuv444 ? kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
             config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(actual.fps.rawValue))
             config.queueDepth = 3; config.showsCursor = true; config.capturesAudio = false
-            queue.sync { self.encoder = encoder; self.needsKeyframe = true; self.inFlight = 0 }
+            let adaptive = request?.adaptive == true
+            queue.sync {
+                self.encoder = encoder; self.needsKeyframe = true; self.inFlight = 0
+                self.timing = actual.timing; self.fps = actual.fps.rawValue; self.ceilingBps = actual.bitrateMbps * 1_000_000
+                self.bitrate = adaptive ? BitrateController(ceilingBps: self.ceilingBps) : nil
+                self.skippedSinceFrame = 0; self.skippedThisSecond = 0; self.sendMsSum = 0; self.sendCount = 0
+            }
             let s = SCStream(filter: SCContentFilter(display: display, excludingWindows: []), configuration: config, delegate: self)
             try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
             stream = s; active = true
@@ -207,18 +294,30 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         DispatchQueue.main.async { [weak self] in self?.onError?("화면 캡처가 중단되었습니다.") }
     }
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen, inFlight < 2, let encoder, let pixel = CMSampleBufferGetImageBuffer(sampleBuffer),
+        guard type == .screen, let encoder, let pixel = CMSampleBufferGetImageBuffer(sampleBuffer),
               let info = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
               let status = info.first?[.status] as? Int, status == SCFrameStatus.complete.rawValue else { return }
+        guard inFlight < 2 else { skippedSinceFrame += 1; skippedThisSecond += 1; return }
+        // displayTime is mach host time of the screen update; arrival time stands in if it is missing.
+        let captured = (info.first?[.displayTime] as? UInt64).flatMap { $0 > 0 && $0 <= mach_absolute_time() ? $0 : nil } ?? mach_absolute_time()
+        let t = timing ? FrameTiming(encodeMs: 0, skipped: skippedSinceFrame, bitrateBps: bitrate?.target ?? ceilingBps) : nil
         inFlight += 1
-        if encoder.encode(pixel, time: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), keyframe: needsKeyframe) { needsKeyframe = false }
-        else { needsKeyframe = true; inFlight -= 1 }
+        if encoder.encode(pixel, time: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), keyframe: needsKeyframe, timing: t, capturedAt: captured) {
+            needsKeyframe = false; skippedSinceFrame = 0
+        } else { needsKeyframe = true; inFlight -= 1 }
     }
-    private func deliver(_ message: Data?) {
-        guard let message else { queue.async { self.needsKeyframe = true; self.inFlight -= 1 }; return }
+    private func deliver(_ out: EncodedFrame) {
+        guard case .message(let message) = out else {
+            queue.async { if case .failed = out { self.needsKeyframe = true }; self.inFlight -= 1 }
+            return
+        }
+        let encoded = mach_absolute_time()
         DispatchQueue.main.async { [weak self] in
             guard let self, self.active, let onFrame = self.onFrame else { return }
-            onFrame(message) { self.queue.async { self.inFlight -= 1 } }
+            onFrame(message) {
+                let ms = hostTimeMs(since: encoded)
+                self.queue.async { self.inFlight -= 1; self.sendMsSum += ms; self.sendCount += 1 }
+            }
         }
     }
 }
