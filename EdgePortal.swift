@@ -128,8 +128,13 @@ final class EdgeSurfacePanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+// 0.11: the grey rubber band is off. The 0.25 s edge-return gate (EdgePressure) still decides crossings;
+// set this to true to show the surface again.
+enum EdgeSurface { static let enabled = false }
+
 // Opaque grey (.92) surface on the pushed edge, click-through and never key.
 final class EdgeSurfaceOverlay {
+    var enabled = EdgeSurface.enabled
     private(set) var panel: EdgeSurfacePanel?
     private(set) var membrane: CAShapeLayer?
     private var key: EdgePressure.Key?
@@ -141,6 +146,7 @@ final class EdgeSurfaceOverlay {
     var reducedMotion: () -> Bool = { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 
     func push(key: EdgePressure.Key, screenFrame frame: CGRect, point: CGPoint, distance: Double) {
+        guard enabled else { return }
         dismissal?.cancel(); dismissal = nil
         let isNew = self.key != key || panel == nil || screenFrame != frame
         if isNew {

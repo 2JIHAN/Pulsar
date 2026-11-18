@@ -160,6 +160,27 @@ final class Viewer: NSView {
     override func keyUp(with e: NSEvent) { sendInput?(InputMessage(kind: .keyUp, code: e.keyCode, flags: UInt64(e.modifierFlags.rawValue))) }
     override func flagsChanged(with e: NSEvent) { sendInput?(InputMessage(kind: .flags, code: e.keyCode, flags: UInt64(e.modifierFlags.rawValue))) }
 }
+// Viewer: the host cursor drawn as this Mac's cursor over the remote screens. Shapes are cached by hash.
+struct RemoteCursor {
+    static let blank = NSCursor(image: NSImage(size: NSSize(width: 1, height: 1), flipped: false) { _ in true }, hotSpot: .zero)
+    private(set) var cache = [String: NSCursor]()
+    private(set) var current: NSCursor?
+    private(set) var visible = true
+    // nil until the host sent a shape; hidden on the host shows a blank cursor here.
+    var shown: NSCursor? { current.map { visible ? $0 : Self.blank } }
+    mutating func reset() { current = nil; visible = true }
+    // False for an image that does not decode to its announced size: the connection is closed.
+    mutating func apply(_ u: CursorUpdate) -> Bool {
+        if let image = u.image, cache[u.hash] == nil {
+            guard let c = image.cursor() else { return false }
+            if cache.count >= 32 { cache.removeAll() }
+            cache[u.hash] = c
+        }
+        if let c = cache[u.hash] { current = c }
+        visible = u.visible
+        return true
+    }
+}
 // Viewer overlay numbers, summed per second. RTT is the newest timed-ping sample.
 struct LiveStats {
     var rttMs: Double?
@@ -262,6 +283,12 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // Host: newest RTT from a timed ping since the last per-second tick.
     var hostRtt: Double?
     var gestureNoted = false
+    let cursorTracker = CursorTracker()
+    // Viewer: the host announced `cursor` (no cursor in the video) and `dockGesture`.
+    var hostCursor = false
+    var hostDockGesture = false
+    var remoteCursor = RemoteCursor()
+    let dockTap = DockGestureTap()
     var qualityWait: DispatchWorkItem?
     weak var awaitedPeer: Peer?
     let injector = InputInjector()
@@ -289,15 +316,16 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         buildWindow()
         viewer.sendInput = { [weak self] m in guard let data = try? JSONEncoder().encode(m) else { return }; self?.outbound?.send(Data([2]) + data) }
         viewer.emergency = { [weak self] in self?.stopAll() }
+        dockTap.onGesture = { [weak self] d in self?.outbound?.send(d.wireMessage()) }
         viewer.onNeedKeyframe = { [weak self] in self?.sendKeyframeRequest(0) }
         // First responder changes only after become/resign return, so re-evaluate afterwards.
-        viewer.focusChanged = { [weak self] in DispatchQueue.main.async { self?.updateHotKeys() } }
+        viewer.focusChanged = { [weak self] in DispatchQueue.main.async { self?.updateSystemInput() } }
         // Deferred: key focus moving between session screen windows is not a focus loss.
         NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: nil, queue: .main) { [weak self] _ in
-            DispatchQueue.main.async { guard let self else { return }; if !self.forwardingKeys { self.sendInput(InputMessage(kind: .release)) }; self.updateHotKeys() }
+            DispatchQueue.main.async { guard let self else { return }; if !self.forwardingKeys { self.sendInput(InputMessage(kind: .release)) }; self.updateSystemInput() }
         }
         for name in [NSWindow.didBecomeKeyNotification, NSApplication.didBecomeActiveNotification, NSApplication.didResignActiveNotification] {
-            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.updateHotKeys() }
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in self?.updateSystemInput() }
         }
         // A local monitor sees key events before menus and also the keyUp of Command combinations,
         // which AppKit never delivers to the view, so remote keys are not left held down.
@@ -343,7 +371,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         uiTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
         deviceTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in self?.refreshDevices() }
         refreshDevices()
-        settings.onSystemChanged = { [weak self] in self?.updateHotKeys() }
+        settings.onSystemChanged = { [weak self] in self?.updateSystemInput() }
         if let listen = Permission.all.first(where: { $0.pane == "Privacy_ListenEvent" }), !listen.granted() { listen.request() }
         preventSleep.state = HostPreferences.preventSleep() ? .on : .off
         guestInput.state = (HostPreferences.allowGuestInput() && AXIsProcessTrusted()) ? .on : .off
@@ -511,6 +539,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         split.splitViewItems[0].isCollapsed = false
         tearDownScreenWindows()
         presentation = .window; localPortal = nil; edgePressure = nil; edgeOverlay.reset()
+        hostCursor = false; hostDockGesture = false; remoteCursor.reset(); NSCursor.arrow.set()
         screenMap = nil; legacyHost = false; layoutChosen = false; sessionView.setMonitors([], current: nil)
         updateStatusItem()
         if NSApp.isHidden { NSApp.unhide(nil) }
@@ -534,6 +563,8 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let w = ScreenWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
             w.isReleasedWhenClosed = false; w.backgroundColor = .black; w.hidesOnDeactivate = false
             w.acceptsMouseMovedEvents = true; w.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle]
+            // The remote cursor is set on every pointer event; window cursor rects would reset it to the arrow.
+            w.disableCursorRects()
             w.contentView = view; w.setFrame(screen.frame, display: false)
             remoteScreens.append(RemoteScreen(id: i, window: w, view: view))
         }
@@ -556,7 +587,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.presentationOptions = [.hideDock, .hideMenuBar]
         sessionView.viewer.format = nil
         requestKeyframes()
-        updateHotKeys()
+        updateSystemInput()
     }
     func presentWindow() {
         presentation = .window; localPortal = nil; edgePressure = nil
@@ -564,7 +595,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if NSApp.isHidden { NSApp.unhide(nil) }
         window.makeKeyAndOrderFront(nil); window.makeFirstResponder(viewer)
         requestKeyframes()
-        updateHotKeys()
+        updateSystemInput()
     }
     // Hidden viewers drop their decoder state so they resume from the next keyframe, not from stale references.
     func hideScreens() {
@@ -574,8 +605,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func goLocal(_ key: EdgePressure.Key, at point: NSPoint) {
         sendInput(InputMessage(kind: .release))
         presentation = .local; localPortal = key
+        NSCursor.arrow.set()
         hideScreens()
-        updateHotKeys()
+        updateSystemInput()
         if clientScreens.indices.contains(key.screen) {
             let f = clientScreens[key.screen].frame, top = NSScreen.screens.first?.frame.maxY ?? f.maxY
             let x = key.side == .left ? f.minX + 4 : f.maxX - 5
@@ -639,8 +671,8 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func routePointer(_ e: NSEvent) -> NSEvent? {
         switch presentation {
         case .local: if e.type == .mouseMoved { localEdge(e) }; return e
-        case .window: return e
-        case .screens: break
+        case .window: refreshCursor(); return e
+        case .screens: refreshCursor()
         }
         let global = NSEvent.mouseLocation
         guard inSession, let rs = remoteScreen(at: global), let kind = Self.pointerKind(e.type) else { return e }
@@ -670,6 +702,24 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             advanceEdge(nil, point: global, now: e.timestamp)
         }
         return nil
+    }
+    func pointerOverRemote() -> Bool {
+        guard inSession, outbound?.ready == true else { return false }
+        let g = NSEvent.mouseLocation
+        switch presentation {
+        case .screens:
+            guard let rs = remoteScreen(at: g) else { return false }
+            return !rs.view.boardContains(windowPoint: rs.window.convertPoint(fromScreen: g))
+        case .window:
+            guard window.isVisible, NSMouseInRect(g, window.frame, false) else { return false }
+            return viewer.contentRect.contains(viewer.convert(window.convertPoint(fromScreen: g), from: nil))
+        case .local: return false
+        }
+    }
+    // Only for a host that sends its cursor; others keep this Mac's arrow and the cursor in the video.
+    func refreshCursor() {
+        guard hostCursor, let c = remoteCursor.shown else { return }
+        (pointerOverRemote() ? c : NSCursor.arrow).set()
     }
     // While local, only the edge the pointer came back through leads into the remote screens again.
     func localEdge(_ e: NSEvent) {
@@ -790,6 +840,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
     }
     func stopStreams() {
+        cursorTracker.stop()
         for s in streams { s.stop() }
         streams = []; streamRequest = nil; injector.rects = [:]
     }
@@ -804,6 +855,10 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let vd = request?.virtualDisplay.flatMap { $0.enabled ? ($0.width, $0.height, $0.scale) : nil }
             startStream(for: p, request: request, screen: 0, streamed: false, source: vd == nil ? nil : .virtual, size: vd)
             return
+        }
+        if request?.cursor == true {
+            cursorTracker.send = { [weak self, weak p] u in if let self, let p, self.host.active === p { p.send(u.wireMessage()) } }
+            cursorTracker.start()
         }
         let assignment = mapScreens(client: screens, host: HostDisplay.streamable(HostDisplay.online()), singleScreenVirtual: request?.virtualDisplay?.enabled ?? false)
         for c in screens {
@@ -896,6 +951,13 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             streams.first { $0.screen == id }?.capture.requestKeyframe()
             return
         }
+        if data.first == DockGesture.messageType {
+            guard let d = DockGesture.decodeWire(data) else { p.close(); return }
+            guard hostAllowsInput(peerKind: p.kind, guestInputAllowed: guestInput.state == .on, accessibilityTrusted: AXIsProcessTrusted()),
+                  streamRequest?.dockGesture == osBuild, DockGesture.supported else { return }
+            injector.applyDock(d)
+            return
+        }
         // Malformed messages close the connection; a well-formed gesture the host cannot replay is ignored.
         guard data.first == 2, data.count <= 100_000, let m = try? JSONDecoder().decode(InputMessage.self, from: data.dropFirst()), m.valid,
               m.kind == .gesture || data.count <= 2048 else { p.close(); return }
@@ -928,19 +990,20 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         outbound = p
         p.onReady = { [weak self, weak p] in
             guard let self, let p else { return }
-            self.hostTiming = false
+            self.hostTiming = false; self.hostCursor = false; self.hostDockGesture = false; self.remoteCursor.reset()
             let prefs = StreamQualityPreferences.load()
             // A redial keeps the screens the session windows were built for.
             if !self.inSession { self.clientScreens = ClientScreen.list(NSScreen.screens); self.layoutHost = self.peerName }
             let saved = ScreenLayoutMemory.load(host: self.layoutHost, screens: self.clientScreens)
             for i in self.clientScreens.indices { self.clientScreens[i].show = saved[self.clientScreens[i].id] }
             let vd = VirtualDisplayRequest.forScreen(NSScreen.screens.first, enabled: prefs.singleScreenVirtual)
-            let req = prefs.request(hevcDecode: VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC), virtualDisplay: vd, screens: self.clientScreens)
+            let req = prefs.request(hevcDecode: VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC), virtualDisplay: vd, screens: self.clientScreens,
+                                    dockGesture: DockGesture.supported ? osBuild : nil)
             p.send(req.wireMessage())
             self.session.connected()
             self.statusText = (p.greet ? "Tailscale로 연결됨." : "암호화 연결됨.") + " 화면을 클릭해 입력하세요. Command+Option+Escape는 긴급 중지입니다." + (AXIsProcessTrusted() ? "" : " 시스템 단축키와 제스처 전달에는 이 Mac의 기기 제어 및 데이터 접근과 입력 모니터링 권한이 필요합니다.")
             self.enterSession()
-            self.updateHotKeys()
+            self.updateSystemInput()
         }
         p.onPacket = { [weak self, weak p] data in
             if data == Data([3]) { return }
@@ -952,9 +1015,15 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             if data.first == EffectiveQuality.messageType {
                 guard let eff = EffectiveQuality.decodeWire(data) else { p?.close(); return }
-                self.hostTiming = eff.timing
+                self.hostTiming = eff.timing; self.hostCursor = eff.cursor; self.hostDockGesture = eff.dockGesture
+                self.refreshCursor(); self.updateSystemInput()
                 for b in self.boards { b.setQuality(eff.summary) }
                 self.settings.setLastEffective(eff.summary)
+                return
+            }
+            if data.first == CursorUpdate.messageType {
+                guard let u = CursorUpdate.decodeWire(data), self.remoteCursor.apply(u) else { p?.close(); return }
+                if self.pointerOverRemote() { self.refreshCursor() }
                 return
             }
             if data.first == ScreenMap.messageType {
@@ -989,7 +1058,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // The last frame stays on screen while redialing.
         p.onClose = { [weak self, weak p] in
             guard let self, let p, self.outbound === p else { return }
-            self.outbound = nil; self.updateHotKeys()
+            self.outbound = nil; self.updateSystemInput()
             switch self.session.closed(failure: p.failure, refused: p.greet && p.connected) {
             case .retry(let attempt):
                 self.statusText = "재연결 중… (\(attempt)회)"
@@ -1007,7 +1076,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         p.start()
     }
-    @objc func disconnectViewer() { session.stop(); let p = outbound; outbound = nil; p?.close(); viewer.clear(); leaveSession(); updateHotKeys() }
+    @objc func disconnectViewer() { session.stop(); let p = outbound; outbound = nil; p?.close(); viewer.clear(); leaveSession(); updateSystemInput() }
     var forwardingKeys: Bool {
         guard outbound?.ready == true else { return false }
         switch presentation {
@@ -1016,7 +1085,12 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case .local: return false
         }
     }
-    func updateHotKeys() { hotKeys.set(forwardingKeys && NSApp.isActive && AXIsProcessTrusted() && ShortcutAction.sendsSystem()) }
+    // Called on every focus, presentation and connection change. The DockSwipe tap exists only while input goes to the remote Mac.
+    func updateSystemInput() {
+        let remote = forwardingKeys && NSApp.isActive && AXIsProcessTrusted()
+        hotKeys.set(remote && ShortcutAction.sendsSystem())
+        dockTap.set(remote && hostDockGesture && DockGesture.supported)
+    }
     func stopHost() {
         qualityWait?.cancel(); qualityWait = nil; awaitedPeer = nil
         hosting = false; listener?.cancel(); listener = nil; tailnetListener?.cancel(); tailnetListener = nil; tailnetState.stringValue = "꺼짐"

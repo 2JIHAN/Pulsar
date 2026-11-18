@@ -56,6 +56,8 @@ func runSelfTests() {
         injector.release(); precondition(posted == 6)
         print("PASS empty release no-op, held key/button/modifier cleanup with nonposting event sink")
         try gestureTests(injector: injector)
+        try cursorTests()
+        try dockGestureTests()
         sessionTests(decoded)
         var pushes = 0, pops = [UnsafeMutableRawPointer]()
         let hotToken = UnsafeMutableRawPointer(bitPattern: 0x1234)!
@@ -780,7 +782,7 @@ func multiScreenTests() throws {
     require(reqWire.count <= QualityRequest.maxWireBytes && QualityRequest.decodeWire(reqWire) == req, "screens roundtrip (\(reqWire.count) bytes)")
     let twoScreens = QualityRequest(codec: .auto, chroma: .yuv420, bitrate: .auto, maxResolution: .p1080, fps: .fps30, hevcDecode: true,
                                     virtualDisplay: VirtualDisplayRequest(enabled: false, width: 3024, height: 1890, scale: 2), screens: [cs(0, main: true, x: 0), cs(1, x: 1512)],
-                                    timing: true, adaptive: true)
+                                    timing: true, adaptive: true, cursor: true, dockGesture: "26B131")
     require(twoScreens.wireMessage().count <= 512, "two screens fit a 0.8 host's 512-byte limit (\(twoScreens.wireMessage().count))")
     func withScreens(_ s: [ClientScreen]) -> Data { QualityRequest(codec: .auto, chroma: .yuv420, bitrate: .auto, maxResolution: .p1080, fps: .fps30, hevcDecode: true, screens: s).wireMessage() }
     var badScreen = cs(1, x: 1512); badScreen.scale = 3
@@ -876,7 +878,12 @@ func multiScreenTests() throws {
     require(turned.animation(key: "transform.scale.x").values?.count == Int((EdgeSurfaceSpring.duration * 1.2 * 120).rounded()) + 1, "release animation sampled at 120 Hz for 0.65 s x 1.2")
 
     _ = NSApplication.shared
-    let overlay = EdgeSurfaceOverlay()
+    let off = EdgeSurfaceOverlay()
+    off.push(key: key, screenFrame: screen, point: CGPoint(x: -30_000, y: -29_500), distance: 12)
+    off.release(crossed: true)
+    require(!EdgeSurface.enabled && !off.enabled && off.panel == nil && off.depthSpring == nil, "edge surface disabled: pushing shows no panel")
+    print("PASS edge surface disabled by EdgeSurface.enabled = false: push/release show nothing; the 250 ms gate above is unchanged")
+    let overlay = EdgeSurfaceOverlay(); overlay.enabled = true
     overlay.reducedMotion = { true }
     overlay.push(key: key, screenFrame: screen, point: CGPoint(x: -30_000, y: -29_500), distance: 12)
     require(overlay.depthSpring == nil && overlay.panel?.ignoresMouseEvents == true && overlay.panel?.canBecomeKey == false && overlay.panel?.canHide == false
@@ -1001,4 +1008,153 @@ func latencyTests() throws {
         e.setBitrate(10_000_000)
         print("PASS \(codec.label) 1440p60 encoder: live bitrate change applied")
     }
+}
+
+func cursorTests() throws {
+    func require(_ condition: @autoclosure () -> Bool, _ message: String, line: UInt = #line) {
+        if !condition() { print("FAIL \(message) (line \(line))"); exit(1) }
+    }
+    _ = NSApplication.shared
+    let base = QualityRequest(codec: .h264, chroma: .yuv420, bitrate: .mbps20, maxResolution: .p1080, fps: .fps30, hevcDecode: false)
+    var capable = base; capable.cursor = true
+    require(!capturesCursor(capable) && capturesCursor(base) && capturesCursor(nil), "showsCursor off only for viewers that announced cursor")
+    let request = StreamQualityPreferences().request(hevcDecode: false)
+    require(request.cursor == true && request.dockGesture == nil && QualityRequest.decodeWire(request.wireMessage()) == request, "0.11 request announces cursor")
+    require(EffectiveQuality.resolve(capable, hostHEVCEncode: false).cursor && !EffectiveQuality.resolve(base, hostHEVCEncode: false).cursor, "cursor negotiated")
+    let legacyEff = EffectiveQuality.decodeWire(Data([6]) + Data(#"{"codec":"h264","chroma":"420","bitrateMbps":8,"maxResolution":"1080p","fps":30,"timing":true}"#.utf8))
+    require(legacyEff?.cursor == false && legacyEff?.dockGesture == false && legacyEff?.timing == true, "0.10 host EffectiveQuality decodes without cursor/dockGesture")
+
+    require(CursorUpdate.Image.renderScale(width: 28, height: 40) == 2 && CursorUpdate.Image.renderScale(width: 200, height: 100) == 1.28, "render scale: 2x, capped at 256 px")
+    let ibeam = try require2(CursorUpdate.Image(cursor: NSCursor.iBeam), "I-beam renders")
+    let size = NSCursor.iBeam.image.size
+    require(ibeam.width == size.width && ibeam.pixelWidth == Int((size.width * 2).rounded()) && ibeam.hotX == NSCursor.iBeam.hotSpot.x && ibeam.png.count <= CursorUpdate.maxPNGBytes, "I-beam image \(ibeam.pixelWidth)x\(ibeam.pixelHeight) px")
+    let big = NSCursor(image: NSImage(size: NSSize(width: 200, height: 100), flipped: false) { r in NSColor.red.setFill(); r.fill(); return true }, hotSpot: NSPoint(x: 199, y: 50))
+    let bigImage = try require2(CursorUpdate.Image(cursor: big), "large cursor renders")
+    require(bigImage.pixelWidth == 256 && bigImage.pixelHeight == 128 && bigImage.width == 200 && bigImage.hotX == 199, "large cursor capped to 256x128 px at 200x100 pt")
+    let made = try require2(ibeam.cursor(), "viewer builds NSCursor")
+    let rep = made.image.representations.first
+    require(made.image.size == size && made.hotSpot == NSCursor.iBeam.hotSpot && rep?.pixelsWide == ibeam.pixelWidth && rep?.size == size, "viewer cursor keeps host points (\(size)) with 2x pixels and hotspot")
+
+    let hash = fnv1a64(ibeam.png)
+    let first = try require2(CursorUpdate.next(hash: hash, image: ibeam, visible: true, sentHash: nil, sentVisible: nil), "first shape sent")
+    require(first.image == ibeam && CursorUpdate.next(hash: hash, image: ibeam, visible: true, sentHash: hash, sentVisible: true) == nil, "same shape and visibility not resent")
+    require(CursorUpdate.next(hash: hash, image: ibeam, visible: false, sentHash: hash, sentVisible: true) == CursorUpdate(visible: false, hash: hash), "visibility change carries no image")
+    require(CursorUpdate.next(hash: "0000000000000001", image: bigImage, visible: false, sentHash: hash, sentVisible: false)?.image == bigImage, "new shape carries its image")
+    let wire = first.wireMessage()
+    require(CursorUpdate.decodeWire(wire) == first && CursorUpdate.decodeWire(CursorUpdate(visible: false, hash: hash).wireMessage())?.image == nil, "cursor update roundtrip (\(wire.count) bytes)")
+    func with(_ f: (inout CursorUpdate.Image) -> Void) -> Data { var i = ibeam; f(&i); return CursorUpdate(visible: true, hash: hash, image: i).wireMessage() }
+    let bad: [Data] = [
+        Data([12]), Data([12]) + Data("{".utf8), Data([13]) + wire.dropFirst(), CursorUpdate(visible: true, hash: "xyz").wireMessage(),
+        CursorUpdate(visible: true, hash: "000000000000000G").wireMessage(),
+        with { $0.pixelWidth = 257 }, with { $0.pixelHeight = 0 }, with { $0.png = Data(repeating: 1, count: 100) },
+        with { $0.png = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + Data(count: CursorUpdate.maxPNGBytes) },
+        with { $0.width = .nan }, with { $0.width = 0 }, with { $0.hotX = -1 }, with { $0.hotY = $0.height + 1 }, with { $0.width = 1000 },
+        Data([12]) + Data(count: CursorUpdate.maxWireBytes),
+    ]
+    for (i, b) in bad.enumerated() { require(CursorUpdate.decodeWire(b) == nil, "bad cursor update \(i) rejected") }
+    var lying = ibeam; lying.pixelWidth += 2; lying.width = Double(lying.pixelWidth) / 2
+    require(lying.valid && lying.cursor() == nil, "PNG whose pixels differ from the announced size is rejected by the viewer")
+
+    var remote = RemoteCursor()
+    require(remote.shown == nil, "nothing shown before a shape")
+    require(remote.apply(first) && remote.shown === remote.cache[hash] && remote.cache.count == 1, "shape cached by hash")
+    let cached = remote.cache[hash]
+    require(remote.apply(CursorUpdate(visible: false, hash: hash)) && remote.shown === RemoteCursor.blank, "hidden host cursor shows a blank cursor")
+    require(remote.apply(CursorUpdate(visible: true, hash: "00000000000000aa")) && remote.shown === cached, "unknown hash without image keeps the current shape")
+    require(remote.apply(first) && remote.cache[hash] === cached, "a resent known shape reuses the cached cursor")
+    var lie = first; lie.image = lying
+    require(!remote.apply(lie.image.map { CursorUpdate(visible: true, hash: "00000000000000bb", image: $0) }!), "undecodable image closes the connection")
+    remote.reset(); require(remote.shown == nil && remote.cache.count == 1, "reset on reconnect keeps the cache")
+    print("PASS cursor: showsCursor off only for cursor-capable viewers, CursorUpdate roundtrip (\(wire.count) bytes) and \(bad.count + 1) malformed updates rejected, shape/visibility dedupe, 2x render capped at 256 px, viewer keeps host point size/hotspot, hidden -> blank, cache by hash")
+
+    if let c = NSCursor.currentSystem, let live = CursorUpdate.Image(cursor: c) {
+        let tracker = CursorTracker(); var updates = [CursorUpdate]()
+        tracker.send = { updates.append($0) }; tracker.start()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3)); tracker.stop()
+        let ticks = updates.count
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        require(ticks >= 1 && updates.count == ticks && updates[0].image != nil && updates.allSatisfy { CursorUpdate.decodeWire($0.wireMessage()) == $0 }, "tracker sends the current shape once, valid on the wire, and stops")
+        print("PASS live system cursor read: \(live.width)x\(live.height) pt, \(live.pixelWidth)x\(live.pixelHeight) px, hotspot (\(live.hotX), \(live.hotY)), PNG \(live.png.count) bytes; 60 Hz tracker sent \(ticks) update(s) in 0.3 s (visible \(updates[0].visible)), none after stop")
+    } else { print("SKIP live system cursor (NSCursor.currentSystem unavailable)") }
+}
+func require2<T>(_ v: T?, _ message: String, line: UInt = #line) throws -> T {
+    guard let v else { print("FAIL \(message) (line \(line))"); exit(1) }
+    return v
+}
+func dockGestureTests() throws {
+    func require(_ condition: @autoclosure () -> Bool, _ message: String, line: UInt = #line) {
+        if !condition() { print("FAIL \(message) (line \(line))"); exit(1) }
+    }
+    let build = osBuild!
+    let base = QualityRequest(codec: .h264, chroma: .yuv420, bitrate: .mbps20, maxResolution: .p1080, fps: .fps30, hevcDecode: false)
+    var capable = base; capable.dockGesture = build
+    require(EffectiveQuality.resolve(capable, hostHEVCEncode: false, hostBuild: build, hostDockGesture: true).dockGesture, "same build negotiates dock gestures")
+    require(!EffectiveQuality.resolve(capable, hostHEVCEncode: false, hostBuild: build + "x", hostDockGesture: true).dockGesture
+            && !EffectiveQuality.resolve(capable, hostHEVCEncode: false, hostBuild: build, hostDockGesture: false).dockGesture
+            && !EffectiveQuality.resolve(base, hostHEVCEncode: false, hostBuild: build, hostDockGesture: true).dockGesture, "other build, unsupported host or old viewer: off")
+    var longBuild = base; longBuild.dockGesture = String(repeating: "A", count: 33)
+    var emptyBuild = base; emptyBuild.dockGesture = ""
+    require(QualityRequest.decodeWire(longBuild.wireMessage()) == nil && QualityRequest.decodeWire(emptyBuild.wireMessage()) == nil, "bad build string rejected")
+    guard DockGesture.supported else { print("SKIP dock gesture codec (needs macOS 27; this Mac is \(ProcessInfo.processInfo.operatingSystemVersionString))"); return }
+
+    var built = 0
+    for motion in [1, 2] {
+        for phase in [1, 2, 4, 8] {
+            let d = DockGesture(motion: motion, phase: phase, progress: phase == 1 ? 0 : -0.375, vx: motion == 1 ? 120 : 0, vy: motion == 2 ? -80 : 0)
+            let e = try require2(d.event(), "event for motion \(motion) phase \(phase)")
+            require(DockGesture.isDockSwipe(e) && DockGesture.inspect(e) == d.projected, "synthesized event decodes to the projected descriptor")
+            require(DockGesture.decodeWire(d.wireMessage()) == d && d.wireMessage().count <= DockGesture.maxWireBytes, "wire roundtrip")
+            built += 1
+        }
+    }
+    let up = DockGesture(motion: 2, phase: 2, progress: 0.5, vx: 3, vy: 40)
+    require(up.projected == DockGesture(motion: 2, phase: 2, progress: -0.5, vx: 3, vy: -40) && DockGesture(motion: 1, phase: 2, progress: 0.5, vx: 40, vy: 3).projected == DockGesture(motion: 1, phase: 2, progress: -0.5, vx: -40, vy: 3), "projection inverts the gesture axis like ThunderControl")
+    let invalid = [DockGesture(motion: 3, phase: 2, progress: 0, vx: 0, vy: 0), DockGesture(motion: 1, phase: 3, progress: 0, vx: 0, vy: 0), DockGesture(motion: 1, phase: 2, progress: 1.5, vx: 0, vy: 0),
+                   DockGesture(motion: 1, phase: 2, progress: .nan, vx: 0, vy: 0), DockGesture(motion: 1, phase: 2, progress: 0, vx: 1e5, vy: 0), DockGesture(motion: 2, phase: 2, progress: 0, vx: 0, vy: .infinity)]
+    for d in invalid { require(d.event() == nil && DockGesture.decodeWire(Data([13]) + ((try? JSONEncoder().encode(d)) ?? Data())) == nil, "invalid descriptor rejected \(d)") }
+    let badWire = [Data([13]), Data([13]) + Data("{}".utf8), Data([2]) + up.wireMessage().dropFirst(), up.wireMessage() + Data(repeating: 32, count: 300), Data([13]) + Data(#"{"motion":2,"phase":2,"progress":"x","vx":0,"vy":0}"#.utf8)]
+    for (i, b) in badWire.enumerated() { require(DockGesture.decodeWire(b) == nil, "bad dock wire \(i) rejected") }
+    let plain = CGEvent(source: nil)!; plain.type = CGEventType(rawValue: 29)!
+    plain.setIntegerValueField(CGEventField(rawValue: 110)!, value: 8)
+    require(!DockGesture.isDockSwipe(plain) && DockGesture.inspect(plain) == nil, "a magnify gesture is not a DockSwipe")
+
+    let injector = InputInjector(); var posted = [CGEvent]()
+    injector.postDock = { posted.append($0) }; injector.postEvent = { _ in }
+    let began = DockGesture(motion: 1, phase: 1, progress: 0, vx: 0, vy: 0), changed = DockGesture(motion: 1, phase: 2, progress: -0.25, vx: -50, vy: 0), ended = DockGesture(motion: 1, phase: 4, progress: -0.625, vx: -900, vy: 0)
+    injector.applyDock(changed); require(posted.isEmpty, "changed without began ignored")
+    injector.applyDock(began); injector.applyDock(changed); injector.applyDock(DockGesture(motion: 2, phase: 2, progress: 0.1, vx: 0, vy: 0)); injector.applyDock(ended)
+    require(posted.compactMap(DockGesture.inspect) == [began.projected, changed.projected, ended.projected] && injector.dock == nil, "began/changed/ended replayed, other motion mid-stream ignored")
+    injector.release(); require(posted.count == 3, "release after a finished stream posts nothing")
+    injector.applyDock(DockGesture(motion: 2, phase: 1, progress: 0, vx: 0, vy: 0)); injector.applyDock(DockGesture(motion: 2, phase: 2, progress: 0.375, vx: 0, vy: 30))
+    injector.release()
+    require(DockGesture.inspect(posted.last!) == DockGesture(motion: 2, phase: 8, progress: -0.375, vx: 0, vy: 0) && injector.dock == nil, "release (disconnect) cancels an open Mission Control stream")
+    injector.applyDock(began); injector.applyDock(DockGesture(motion: 2, phase: 1, progress: 0, vx: 0, vy: 0))
+    require(posted.suffix(2).compactMap(DockGesture.inspect).map(\.phase) == [8, 1] && injector.dock?.motion == 2, "a new began cancels a stream whose end was lost")
+    injector.release()
+    print("PASS dock gesture codec: \(built) synthesized DockSwipe events (Spaces + Mission Control/App Exposé, phases 1/2/4/8) decode to their projected descriptors, \(invalid.count) invalid descriptors and \(badWire.count) bad messages rejected, host replay order, cancel on release, build/capability negotiation")
+
+    let tap = DockGestureTap(); var made = 0, enables = [Bool](), sent = [DockGesture]()
+    tap.makeTap = { _ in made += 1; return CFMachPortCreate(nil, { _, _, _, _ in }, nil, nil) }
+    tap.enableTap = { _, on in enables.append(on) }
+    tap.onGesture = { sent.append($0) }
+    func swipe(_ d: DockGesture, pid: Int64 = 1) -> CGEvent { let e = DGMakeDockSwipe(Int32(d.motion), Int32(d.phase), d.progress, d.vx, d.vy)!; e.setIntegerValueField(.eventSourceUnixProcessID, value: pid); return e }
+    let dockType = CGEventType(rawValue: 30)!
+    require(!tap.handle(dockType, swipe(began)) && sent.isEmpty, "not installed: DockSwipe passes through")
+    tap.set(false); require(made == 0 && enables.isEmpty, "removing an absent tap is a no-op")
+    tap.set(true); tap.set(true); require(made == 1 && tap.installed && enables == [true], "installed once")
+    require(!tap.handle(dockType, plain) && !tap.handle(.mouseMoved, CGEvent(source: nil)!), "other events pass")
+    require(!tap.handle(dockType, swipe(began, pid: Int64(getpid()))) && sent.isEmpty, "this process's own replay passes")
+    require(tap.handle(dockType, swipe(changed)) && sent.isEmpty, "changed without began swallowed, not sent")
+    require(tap.handle(dockType, swipe(began)) && tap.handle(dockType, swipe(changed)) && sent == [began, changed] && tap.stream == changed, "began/changed swallowed and sent")
+    require(!tap.handle(.tapDisabledByTimeout, plain) && enables == [true, true], "timeout re-enables the tap")
+    tap.set(false)
+    require(!tap.installed && enables.last == false && sent.last == changed.cancelled && tap.stream == nil, "removing mid-swipe sends a cancel")
+    require(!tap.handle(dockType, swipe(began)) && sent.count == 3, "after removal nothing is swallowed")
+    tap.set(true); _ = tap.handle(dockType, swipe(began)); _ = tap.handle(dockType, swipe(ended)); tap.set(false)
+    require(sent.suffix(2) == [began, ended] && made == 2 && tap.stream == nil, "a finished stream sends no extra cancel")
+    tap.set(true); _ = tap.handle(dockType, swipe(DockGesture(motion: 1, phase: 2, progress: 0, vx: 0, vy: 0)))
+    let unknown = swipe(began); unknown.setIntegerValueField(CGEventField(rawValue: 123)!, value: 3)
+    require(tap.handle(dockType, unknown) && sent.count == 5, "other DockSwipe motions (pinch) swallowed while remote, not sent")
+    tap.set(false)
+    print("PASS dock gesture tap: installed only on request and once, removed idempotently, swallows DockSwipe only while installed, forwards began/changed/ended, cancel on removal mid-swipe, timeout re-enable, own replays and other events pass")
 }

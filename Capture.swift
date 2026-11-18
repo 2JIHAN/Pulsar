@@ -256,7 +256,7 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
             config.height = scaled.height
             config.pixelFormat = actual.chroma == .yuv444 ? kCVPixelFormatType_444YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
             config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(actual.fps.rawValue))
-            config.queueDepth = 3; config.showsCursor = true; config.capturesAudio = false
+            config.queueDepth = 3; config.showsCursor = capturesCursor(request); config.capturesAudio = false
             let adaptive = request?.adaptive == true
             queue.sync {
                 self.encoder = encoder; self.needsKeyframe = true; self.inFlight = 0
@@ -321,8 +321,73 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 }
+// 0.11 viewers draw the cursor themselves from CursorUpdate; older ones need it in the video.
+func capturesCursor(_ request: QualityRequest?) -> Bool { request?.cursor != true }
+
+@_silgen_name("CGSCurrentCursorSeed") private func CGSCurrentCursorSeed() -> Int32
+// Deprecated and unavailable to Swift, but on macOS 27.2.1 it still reads the window server's global
+// state: measured 0 while another process hid the cursor or it was hidden until the mouse moves, 1 otherwise.
+@_silgen_name("CGCursorIsVisible") private func CGCursorIsVisibleGlobal() -> Int32
+
+extension CursorUpdate.Image {
+    // At most 2x and at most 256 px on the long side; a 1x viewer screen downsamples.
+    static func renderScale(width: Double, height: Double) -> Double { min(2, Double(CursorUpdate.maxPixels) / max(1, width, height)) }
+    // NSCursor.currentSystem is the cursor any app has set (measured with another process setting
+    // I-beam and resize cursors). Its image has 1x to 10x representations, so it is redrawn at a bounded size.
+    init?(cursor: NSCursor) {
+        let size = cursor.image.size
+        guard size.width >= 1, size.height >= 1 else { return nil }
+        let scale = Self.renderScale(width: size.width, height: size.height)
+        let pw = max(1, Int((size.width * scale).rounded())), ph = max(1, Int((size.height * scale).rounded()))
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: pw, pixelsHigh: ph, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                         isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+              let context = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+        rep.size = size
+        NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = context
+        cursor.image.draw(in: NSRect(origin: .zero, size: size))
+        NSGraphicsContext.restoreGraphicsState()
+        guard let png = rep.representation(using: .png, properties: [:]) else { return nil }
+        self.init(png: png, pixelWidth: pw, pixelHeight: ph, width: size.width, height: size.height, hotX: cursor.hotSpot.x, hotY: cursor.hotSpot.y)
+        guard valid else { return nil }
+    }
+    // Viewer side. nil when the PNG does not decode to the announced pixel size.
+    func cursor() -> NSCursor? {
+        guard valid, let rep = NSBitmapImageRep(data: png), rep.pixelsWide == pixelWidth, rep.pixelsHigh == pixelHeight else { return nil }
+        rep.size = NSSize(width: width, height: height)
+        let image = NSImage(size: rep.size); image.addRepresentation(rep)
+        return NSCursor(image: image, hotSpot: NSPoint(x: hotX, y: hotY))
+    }
+}
+// Host: polls the system cursor at 60 Hz while a 0.11 viewer is connected. The seed changes with the
+// shape (~0.04 ms per read); the image is only fetched and encoded when it does (~0.5 ms).
+// Cursor warps by host apps are not reported; the viewer's own pointer position stays authoritative.
+final class CursorTracker {
+    var send: ((CursorUpdate) -> Void)?
+    private var timer: Timer?
+    private var seed: Int32?
+    private var shape: (hash: String, image: CursorUpdate.Image)?
+    private var sentHash: String?, sentVisible: Bool?
+    func start() {
+        stop()
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.tick() }
+    }
+    func stop() { timer?.invalidate(); timer = nil; seed = nil; shape = nil; sentHash = nil; sentVisible = nil }
+    private func tick() {
+        let s = CGSCurrentCursorSeed()
+        if s != seed, let c = NSCursor.currentSystem, let image = CursorUpdate.Image(cursor: c) {
+            seed = s; shape = (fnv1a64(image.png), image)
+        }
+        guard let shape, let u = CursorUpdate.next(hash: shape.hash, image: shape.image, visible: CGCursorIsVisibleGlobal() != 0, sentHash: sentHash, sentVisible: sentVisible) else { return }
+        sentHash = u.hash; sentVisible = u.visible
+        send?(u)
+    }
+}
 final class InputInjector {
     var postEvent: (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) }
+    // DockSwipe replays go where Dock reads them, like ThunderControl's receiver.
+    var postDock: (CGEvent) -> Void = { $0.post(tap: .cgSessionEventTap) }
+    // The DockSwipe stream being replayed; cancelled by release() so Dock is not left mid-swipe.
+    private(set) var dock: DockGesture?
     private func post(_ event: CGEvent?) { if let event = event { postEvent(event) } }
     // Host display bounds per viewer screen id. Each stream maps 0...1 into its own display.
     var rects = [Int: CGRect]()
@@ -367,7 +432,20 @@ final class InputInjector {
         }
         event?.flags = flags; post(event)
     }
+    func applyDock(_ d: DockGesture) {
+        guard d.valid else { return }
+        if d.phase == 1 { if let old = dock { postDockEvent(old.cancelled) } }
+        else if dock?.motion != d.motion { return }
+        dock = d.terminal ? nil : d
+        postDockEvent(d)
+    }
+    private func postDockEvent(_ d: DockGesture) {
+        guard let event = d.event() else { return }
+        event.location = CGEvent(source: nil)?.location ?? lastPoint
+        postDock(event)
+    }
     func release() {
+        if let d = dock { dock = nil; postDockEvent(d.cancelled) }
         for key in keys { post(CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: false)) }
         for b in buttons {
             let type: CGEventType = b == 0 ? .leftMouseUp : b == 1 ? .rightMouseUp : .otherMouseUp

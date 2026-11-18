@@ -26,7 +26,8 @@ A personal, Parsec-like remote desktop for the owner's own Macs that rides the o
 
 ## Capabilities and Constraints
 - Video: H.264 hardware encoding, up to 1920x1200, up to 30 fps, one display.
-- Input: mouse, scroll, keyboard, app shortcuts, system shortcuts while the viewer is focused, pinch/rotate/smart magnify/swipe gestures (same macOS build required). 3/4-finger Dock gestures are not supported.
+- Input: mouse, scroll, keyboard, app shortcuts, system shortcuts while the viewer is focused, pinch/rotate/smart magnify/swipe gestures and 3/4-finger Spaces, Mission Control and App Exposé swipes (same macOS build required; Dock swipes also need macOS 27).
+- Cursor: the host cursor is drawn as the viewer's own cursor (shape and visibility sent separately), not baked into the video, when both Macs run 0.11.
 - One-tap connect works for Macs on the same Tailscale account; sharing can start automatically at launch. Disconnect, overlay and full-screen shortcuts are user-configurable and handled locally during a session.
 
 ## Brand Commitments

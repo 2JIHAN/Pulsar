@@ -110,7 +110,7 @@ None beyond the native window shadow. Groups are flat fills with 12px radius; ta
 - **Device board:** NSTableView, 44px rows, 1px rule under each row, semibold 12px grey headers, connect button at row end.
 - **Grouped rows:** System Settings style groups on the 연결코드 and 설정 pages.
 - **Session board:** 36px dark bar, red pulsing dot, peer name, live fps and Mbps, 전체 화면 and 연결 종료. Fades over 200ms ease-out; pulse 250ms; both off under Reduce Motion.
-- **Edge surface:** opaque grey (white 0.92, #EBEBEB) rubber band on the left or right outer edge of a screen while the pointer pushes out of it. Up to 26 pt deep and 140 pt along the edge, centred on the pointer and kept inside the screen. Depth follows f(u) = u*26*1.5 / (26 + 1.5u) on a damped spring; release returns with a 1.2x slower response and fades. A non-activating, click-through panel that never takes focus. Under Reduce Motion the spring is replaced by a 0.1 s ease, while the 0.25 s push threshold stays the same. Ported from ThunderControl.
+- **Edge surface (disabled in 0.11 by `EdgeSurface.enabled`; the 0.25 s push gate remains):** opaque grey (white 0.92, #EBEBEB) rubber band on the left or right outer edge of a screen while the pointer pushes out of it. Up to 26 pt deep and 140 pt along the edge, centred on the pointer and kept inside the screen. Depth follows f(u) = u*26*1.5 / (26 + 1.5u) on a damped spring; release returns with a 1.2x slower response and fades. A non-activating, click-through panel that never takes focus. Under Reduce Motion the spring is replaced by a 0.1 s ease, while the 0.25 s push threshold stays the same. Ported from ThunderControl.
 
 ## Do's and Don'ts
 - Do keep the device list a ruled table.

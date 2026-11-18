@@ -540,9 +540,9 @@ struct StreamQualityPreferences: Equatable {
         d.set(edgeReturn, forKey: Self.edgeReturnKey)
         d.set(adaptiveBitrate, forKey: Self.adaptiveKey)
     }
-    func request(hevcDecode: Bool, virtualDisplay: VirtualDisplayRequest? = nil, screens: [ClientScreen]? = nil) -> QualityRequest {
+    func request(hevcDecode: Bool, virtualDisplay: VirtualDisplayRequest? = nil, screens: [ClientScreen]? = nil, dockGesture: String? = nil) -> QualityRequest {
         QualityRequest(codec: codec, chroma: codec == .h264 ? .yuv420 : chroma, bitrate: bitrate, maxResolution: maxResolution, fps: fps, hevcDecode: hevcDecode, virtualDisplay: virtualDisplay, screens: screens,
-                       timing: true, adaptive: adaptiveBitrate)
+                       timing: true, adaptive: adaptiveBitrate, cursor: true, dockGesture: dockGesture)
     }
 }
 
@@ -717,6 +717,47 @@ enum KeyframeRequest {
     }
 }
 
+// Host -> viewer [12][JSON], only to viewers that announced `cursor`. Sent when the shape (hash of the
+// PNG) or the visibility changes; `image` rides along only with a new shape.
+struct CursorUpdate: Codable, Equatable {
+    static let messageType: UInt8 = 12
+    static let maxPixels = 256, maxPNGBytes = 256 * 1024, maxWireBytes = 360 * 1024
+    struct Image: Codable, Equatable {
+        var png: Data
+        var pixelWidth: Int, pixelHeight: Int
+        // Points, hotspot from the top-left. The viewer draws it at this point size, so it looks the same size as on the host.
+        var width: Double, height: Double
+        var hotX: Double, hotY: Double
+        var valid: Bool {
+            func ratio(_ px: Int, _ pt: Double) -> Bool { (0.5...4).contains(Double(px) / pt) }
+            return (1...CursorUpdate.maxPixels).contains(pixelWidth) && (1...CursorUpdate.maxPixels).contains(pixelHeight)
+                && (8...CursorUpdate.maxPNGBytes).contains(png.count) && png.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+                && [width, height, hotX, hotY].allSatisfy(\.isFinite) && width >= 1 && height >= 1 && ratio(pixelWidth, width) && ratio(pixelHeight, height)
+                && (0...width).contains(hotX) && (0...height).contains(hotY)
+        }
+    }
+    var visible: Bool
+    var hash: String
+    var image: Image? = nil
+    func wireMessage() -> Data { Data([Self.messageType]) + ((try? JSONEncoder().encode(self)) ?? Data()) }
+    static func decodeWire(_ data: Data) -> CursorUpdate? {
+        guard data.first == messageType, data.count > 1, data.count <= maxWireBytes,
+              let u = try? JSONDecoder().decode(CursorUpdate.self, from: data.dropFirst()),
+              u.hash.count == 16, u.hash.allSatisfy({ $0.isHexDigit && $0.isASCII }), u.image?.valid ?? true else { return nil }
+        return u
+    }
+    // Host side: nil when the viewer already shows this shape and visibility.
+    static func next(hash: String, image: Image, visible: Bool, sentHash: String?, sentVisible: Bool?) -> CursorUpdate? {
+        if hash != sentHash { return CursorUpdate(visible: visible, hash: hash, image: image) }
+        return visible == sentVisible ? nil : CursorUpdate(visible: visible, hash: hash)
+    }
+}
+func fnv1a64(_ data: Data) -> String {
+    var h: UInt64 = 0xcbf29ce484222325
+    for b in data { h = (h ^ UInt64(b)) &* 0x100000001b3 }
+    return String(format: "%016llx", h)
+}
+
 // Type 3 is the keepalive. Older peers send and expect exactly [3]; peers that both announced `timing`
 // also send [3][0][UInt64 BE sender uptime ns] and answer with the same bytes and kind 1, so the
 // sender measures a round trip on its own clock. It rides behind video in the same TCP stream, so it
@@ -779,6 +820,10 @@ struct QualityRequest: Codable, Equatable {
     // `adaptive` lets the host lower the bitrate below `bitrate` on a congested link. Older viewers omit both.
     var timing: Bool? = nil
     var adaptive: Bool? = nil
+    // 0.11 viewers set `cursor`: they draw the host cursor from CursorUpdate, so the host leaves it out
+    // of the video. `dockGesture` is the viewer's OS build when it can capture DockSwipe events.
+    var cursor: Bool? = nil
+    var dockGesture: String? = nil
 
     func wireMessage() -> Data {
         let json = (try? JSONEncoder().encode(self)) ?? Data()
@@ -789,6 +834,7 @@ struct QualityRequest: Codable, Equatable {
               let req = try? JSONDecoder().decode(QualityRequest.self, from: data.dropFirst()) else { return nil }
         if let vd = req.virtualDisplay, !vd.valid { return nil }
         if let s = req.screens, !ClientScreen.validList(s) { return nil }
+        if let b = req.dockGesture, b.isEmpty || b.count > 32 { return nil }
         return req
     }
 }
@@ -804,12 +850,16 @@ struct EffectiveQuality: Codable, Equatable {
     var virtualDisplay: Bool = false
     // The host honours the viewer's `timing`: frames carry FrameTiming and timed pings are answered.
     var timing: Bool = false
+    // The host sends CursorUpdate and captures without the cursor.
+    var cursor: Bool = false
+    // The host replays DockGesture messages: both Macs run the same OS build and the bridge works here.
+    var dockGesture: Bool = false
 
     enum CodingKeys: String, CodingKey {
-        case codec, chroma, bitrateMbps, maxResolution, fps, virtualDisplay, timing
+        case codec, chroma, bitrateMbps, maxResolution, fps, virtualDisplay, timing, cursor, dockGesture
     }
 
-    init(codec: ResolvedCodec, chroma: ChromaOption, bitrateMbps: Int, maxResolution: MaxResolutionOption, fps: FPSOption, virtualDisplay: Bool = false, timing: Bool = false) {
+    init(codec: ResolvedCodec, chroma: ChromaOption, bitrateMbps: Int, maxResolution: MaxResolutionOption, fps: FPSOption, virtualDisplay: Bool = false, timing: Bool = false, cursor: Bool = false, dockGesture: Bool = false) {
         self.codec = codec
         self.chroma = chroma
         self.bitrateMbps = bitrateMbps
@@ -817,6 +867,8 @@ struct EffectiveQuality: Codable, Equatable {
         self.fps = fps
         self.virtualDisplay = virtualDisplay
         self.timing = timing
+        self.cursor = cursor
+        self.dockGesture = dockGesture
     }
 
     init(from decoder: Decoder) throws {
@@ -828,6 +880,8 @@ struct EffectiveQuality: Codable, Equatable {
         fps = try c.decode(FPSOption.self, forKey: .fps)
         virtualDisplay = try c.decodeIfPresent(Bool.self, forKey: .virtualDisplay) ?? false
         timing = try c.decodeIfPresent(Bool.self, forKey: .timing) ?? false
+        cursor = try c.decodeIfPresent(Bool.self, forKey: .cursor) ?? false
+        dockGesture = try c.decodeIfPresent(Bool.self, forKey: .dockGesture) ?? false
     }
 
     static let legacyDefaults = EffectiveQuality(codec: .h264, chroma: .yuv420, bitrateMbps: 8, maxResolution: .p1080, fps: .fps30)
@@ -838,12 +892,14 @@ struct EffectiveQuality: Codable, Equatable {
         return "\(codecPart) · \(maxResolution.label) · \(fps.rawValue)fps · \(bitrateMbps)Mbps\(vdPart)"
     }
 
-    static func resolve(_ req: QualityRequest, hostHEVCEncode: Bool, hostHEVC444Encode: Bool = true, virtualDisplay: Bool = false) -> EffectiveQuality {
+    static func resolve(_ req: QualityRequest, hostHEVCEncode: Bool, hostHEVC444Encode: Bool = true, virtualDisplay: Bool = false,
+                        hostBuild: String? = osBuild, hostDockGesture: Bool = DockGesture.supported) -> EffectiveQuality {
         let canHEVC = hostHEVCEncode && req.hevcDecode
         let resolvedCodec: ResolvedCodec = (req.codec != .h264 && canHEVC) ? .hevc : .h264
         let resolvedChroma: ChromaOption = (resolvedCodec == .hevc && req.chroma == .yuv444 && hostHEVC444Encode) ? .yuv444 : .yuv420
         let mbps = BitrateOption.allowedMbps.contains(req.bitrate.mbps) ? req.bitrate.mbps : 8
-        return EffectiveQuality(codec: resolvedCodec, chroma: resolvedChroma, bitrateMbps: mbps, maxResolution: req.maxResolution, fps: req.fps, virtualDisplay: virtualDisplay, timing: req.timing ?? false)
+        return EffectiveQuality(codec: resolvedCodec, chroma: resolvedChroma, bitrateMbps: mbps, maxResolution: req.maxResolution, fps: req.fps, virtualDisplay: virtualDisplay, timing: req.timing ?? false,
+                                cursor: req.cursor ?? false, dockGesture: hostDockGesture && req.dockGesture != nil && req.dockGesture == hostBuild)
     }
 
     func wireMessage() -> Data {
