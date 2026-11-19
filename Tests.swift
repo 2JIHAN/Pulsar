@@ -59,6 +59,17 @@ func runSelfTests() {
         try cursorTests()
         updaterTests()
         clickCountTests()
+        do {
+            var req = QualityRequest(codec: .auto, chroma: .yuv444, bitrate: .mbps35, maxResolution: .native, fps: .fps60, hevcDecode: true)
+            precondition(QualityRequest.decodeWire(req.wireMessage())?.priority == nil, "FAIL request without priority")
+            req.priority = .quality
+            precondition(QualityRequest.decodeWire(req.wireMessage())?.priority == .quality, "FAIL priority roundtrip")
+            let eff = EffectiveQuality.resolve(req, hostHEVCEncode: true)
+            precondition(eff.priority == .quality && EffectiveQuality.decodeWire(eff.wireMessage())?.priority == .quality && eff.summary.hasSuffix("품질 우선"), "FAIL effective priority")
+            precondition(EffectiveQuality.decodeWire(EffectiveQuality.legacyDefaults.wireMessage())?.priority == nil, "FAIL old host without priority")
+            precondition(peakSixteenths(nil) == 3 && peakSixteenths(.speed) == 3 && peakSixteenths(.quality) == 5, "FAIL peak ratio")
+            print("PASS priority: request/effective roundtrip, absent from older peers, peak 1.5x (speed, unset) or 2.5x (quality)")
+        }
         scrollAndStandardCursorTests()
         // Regression: the cursor must fill its bitmap, not only the lower-left corner, on host and viewer.
         let fullCursor = NSCursor(image: NSImage(size: NSSize(width: 20, height: 10), flipped: false) { r in NSColor.red.setFill(); r.fill(); return true }, hotSpot: .zero)

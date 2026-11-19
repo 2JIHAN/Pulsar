@@ -473,6 +473,10 @@ enum MaxResolutionOption: String, Codable, CaseIterable {
         return (max(2, Int(w * scale) / 2 * 2), max(2, Int(h * scale) / 2 * 2))
     }
 }
+// Speed keeps frames small and out at once; quality lets scene changes take bigger frames.
+enum StreamPriority: String, Codable, CaseIterable { case speed, quality
+    var label: String { self == .speed ? "속도 우선" : "품질 우선" }
+}
 enum FPSOption: Int, Codable, CaseIterable {
     case fps30 = 30
     case fps60 = 60
@@ -509,7 +513,9 @@ struct StreamQualityPreferences: Equatable {
     var singleScreenVirtual: Bool = false
     var edgeReturn: Bool = true
     var adaptiveBitrate: Bool = true
+    var priority: StreamPriority = .speed
 
+    private static let priorityKey = "quality.priority"
     private static let codecKey = "quality.codec"
     private static let chromaKey = "quality.chroma"
     private static let bitrateKey = "quality.bitrate"
@@ -530,6 +536,7 @@ struct StreamQualityPreferences: Equatable {
         if d.object(forKey: virtualDisplayKey) != nil { p.singleScreenVirtual = d.bool(forKey: virtualDisplayKey) }
         if d.object(forKey: edgeReturnKey) != nil { p.edgeReturn = d.bool(forKey: edgeReturnKey) }
         if d.object(forKey: adaptiveKey) != nil { p.adaptiveBitrate = d.bool(forKey: adaptiveKey) }
+        if let raw = d.string(forKey: priorityKey), let v = StreamPriority(rawValue: raw) { p.priority = v }
         return p
     }
     func save(_ d: UserDefaults = .standard) {
@@ -541,10 +548,11 @@ struct StreamQualityPreferences: Equatable {
         d.set(singleScreenVirtual, forKey: Self.virtualDisplayKey)
         d.set(edgeReturn, forKey: Self.edgeReturnKey)
         d.set(adaptiveBitrate, forKey: Self.adaptiveKey)
+        d.set(priority.rawValue, forKey: Self.priorityKey)
     }
     func request(hevcDecode: Bool, virtualDisplay: VirtualDisplayRequest? = nil, screens: [ClientScreen]? = nil, dockGesture: String? = nil) -> QualityRequest {
         QualityRequest(codec: codec, chroma: codec == .h264 ? .yuv420 : chroma, bitrate: bitrate, maxResolution: maxResolution, fps: fps, hevcDecode: hevcDecode, virtualDisplay: virtualDisplay, screens: screens,
-                       timing: true, adaptive: adaptiveBitrate, cursor: true, dockGesture: dockGesture)
+                       timing: true, adaptive: adaptiveBitrate, cursor: true, dockGesture: dockGesture, priority: priority)
     }
 }
 
@@ -838,6 +846,8 @@ struct QualityRequest: Codable, Equatable {
     // of the video. `dockGesture` is the viewer's OS build when it can capture DockSwipe events.
     var cursor: Bool? = nil
     var dockGesture: String? = nil
+    // 0.16 viewers: speed or quality priority for the host encoder. Absent keeps the 0.15 encoder settings.
+    var priority: StreamPriority? = nil
 
     func wireMessage() -> Data {
         let json = (try? JSONEncoder().encode(self)) ?? Data()
@@ -868,9 +878,11 @@ struct EffectiveQuality: Codable, Equatable {
     var cursor: Bool = false
     // The host replays DockGesture messages: both Macs run the same OS build and the bridge works here.
     var dockGesture: Bool = false
+    // The encoder priority the host applied; nil from hosts before 0.16 or for viewers that sent none.
+    var priority: StreamPriority? = nil
 
     enum CodingKeys: String, CodingKey {
-        case codec, chroma, bitrateMbps, maxResolution, fps, virtualDisplay, timing, cursor, dockGesture
+        case codec, chroma, bitrateMbps, maxResolution, fps, virtualDisplay, timing, cursor, dockGesture, priority
     }
 
     init(codec: ResolvedCodec, chroma: ChromaOption, bitrateMbps: Int, maxResolution: MaxResolutionOption, fps: FPSOption, virtualDisplay: Bool = false, timing: Bool = false, cursor: Bool = false, dockGesture: Bool = false) {
@@ -896,6 +908,7 @@ struct EffectiveQuality: Codable, Equatable {
         timing = try c.decodeIfPresent(Bool.self, forKey: .timing) ?? false
         cursor = try c.decodeIfPresent(Bool.self, forKey: .cursor) ?? false
         dockGesture = try c.decodeIfPresent(Bool.self, forKey: .dockGesture) ?? false
+        priority = try c.decodeIfPresent(StreamPriority.self, forKey: .priority)
     }
 
     static let legacyDefaults = EffectiveQuality(codec: .h264, chroma: .yuv420, bitrateMbps: 8, maxResolution: .p1080, fps: .fps30)
@@ -903,7 +916,8 @@ struct EffectiveQuality: Codable, Equatable {
     var summary: String {
         let codecPart = chroma == .yuv444 ? "\(codec.label) 4:4:4" : codec.label
         let vdPart = virtualDisplay ? " · 가상 화면" : ""
-        return "\(codecPart) · \(maxResolution.label) · \(fps.rawValue)fps · \(bitrateMbps)Mbps\(vdPart)"
+        let priorityPart = priority.map { " · \($0.label)" } ?? ""
+        return "\(codecPart) · \(maxResolution.label) · \(fps.rawValue)fps · \(bitrateMbps)Mbps\(vdPart)\(priorityPart)"
     }
 
     static func resolve(_ req: QualityRequest, hostHEVCEncode: Bool, hostHEVC444Encode: Bool = true, virtualDisplay: Bool = false,
@@ -912,8 +926,10 @@ struct EffectiveQuality: Codable, Equatable {
         let resolvedCodec: ResolvedCodec = (req.codec != .h264 && canHEVC) ? .hevc : .h264
         let resolvedChroma: ChromaOption = (resolvedCodec == .hevc && req.chroma == .yuv444 && hostHEVC444Encode) ? .yuv444 : .yuv420
         let mbps = BitrateOption.allowedMbps.contains(req.bitrate.mbps) ? req.bitrate.mbps : 8
-        return EffectiveQuality(codec: resolvedCodec, chroma: resolvedChroma, bitrateMbps: mbps, maxResolution: req.maxResolution, fps: req.fps, virtualDisplay: virtualDisplay, timing: req.timing ?? false,
+        var q = EffectiveQuality(codec: resolvedCodec, chroma: resolvedChroma, bitrateMbps: mbps, maxResolution: req.maxResolution, fps: req.fps, virtualDisplay: virtualDisplay, timing: req.timing ?? false,
                                 cursor: req.cursor ?? false, dockGesture: hostDockGesture && req.dockGesture != nil && req.dockGesture == hostBuild)
+        q.priority = req.priority
+        return q
     }
 
     func wireMessage() -> Data {

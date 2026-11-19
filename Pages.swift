@@ -562,6 +562,7 @@ final class SettingsPage: NSObject {
     let bitratePopup = NSPopUpButton()
     let resolutionPopup = NSPopUpButton()
     let fpsControl = NSSegmentedControl(labels: ["30 fps", "60 fps"], trackingMode: .selectOne, target: nil, action: nil)
+    let priorityControl = NSSegmentedControl(labels: StreamPriority.allCases.map(\.label), trackingMode: .selectOne, target: nil, action: nil)
     let virtualDisplaySwitch = NSSwitch()
     let edgeReturnSwitch = NSSwitch()
     let adaptiveSwitch = NSSwitch()
@@ -609,10 +610,11 @@ final class SettingsPage: NSObject {
         bitratePopup.addItems(withTitles: ["자동 (8 Mbps)", "5 Mbps", "10 Mbps", "20 Mbps", "35 Mbps", "50 Mbps"])
         resolutionPopup.addItems(withTitles: ["1080p (1920×1080)", "1440p (2560×1440)", "원본 (최대 3840×2400)"])
         for c in [codecPopup, bitratePopup, adaptiveSwitch, resolutionPopup, virtualDisplaySwitch, edgeReturnSwitch] as [NSControl] { c.target = self; c.action = #selector(qualityChanged) }
-        for c in [chromaControl, fpsControl] as [NSSegmentedControl] { c.target = self; c.action = #selector(qualityChanged) }
+        for c in [chromaControl, fpsControl, priorityControl] as [NSSegmentedControl] { c.target = self; c.action = #selector(qualityChanged) }
         syncQualityControls()
         qualityNote.lineBreakMode = .byWordWrapping; qualityNote.maximumNumberOfLines = 0
         let qualityRows = [
+            settingRow("우선순위", "속도 우선은 H.264, 4:2:0, 60 fps로 지연을 줄입니다. 품질 우선은 HEVC 4:4:4, 원본 해상도, 35 Mbps로 글자와 사진을 선명하게 하며 지연이 조금 늘 수 있습니다. 고른 뒤 아래 항목을 따로 바꿀 수 있습니다.", [priorityControl]),
             settingRow("코덱", "자동은 양쪽 Mac이 하드웨어 HEVC를 지원할 때 HEVC를 사용합니다.", [codecPopup]),
             settingRow("색상", "선명한 글자(4:4:4)는 HEVC에서만 활성화되며, 미지원 시 4:2:0으로 적용됩니다.", [chromaControl]),
             settingRow("비트레이트", "화면마다 적용하는 최대값입니다. 순간 대역폭은 평균의 1.5배로 제한합니다.", [bitratePopup]),
@@ -655,6 +657,7 @@ final class SettingsPage: NSObject {
         bitratePopup.selectItem(at: BitrateOption.allCases.firstIndex(of: prefs.bitrate) ?? 0)
         resolutionPopup.selectItem(at: MaxResolutionOption.allCases.firstIndex(of: prefs.maxResolution) ?? 0)
         fpsControl.selectedSegment = FPSOption.allCases.firstIndex(of: prefs.fps) ?? 0
+        priorityControl.selectedSegment = StreamPriority.allCases.firstIndex(of: prefs.priority) ?? 0
         virtualDisplaySwitch.state = prefs.singleScreenVirtual ? .on : .off
         edgeReturnSwitch.state = prefs.edgeReturn ? .on : .off
         adaptiveSwitch.state = prefs.adaptiveBitrate ? .on : .off
@@ -672,11 +675,22 @@ final class SettingsPage: NSObject {
         prefs.bitrate = BitrateOption.allCases[max(0, bitratePopup.indexOfSelectedItem)]
         prefs.maxResolution = MaxResolutionOption.allCases[max(0, resolutionPopup.indexOfSelectedItem)]
         prefs.fps = FPSOption.allCases[max(0, fpsControl.selectedSegment)]
+        prefs.priority = StreamPriority.allCases[max(0, priorityControl.selectedSegment)]
         prefs.singleScreenVirtual = virtualDisplaySwitch.state == .on
         prefs.edgeReturn = edgeReturnSwitch.state == .on
         prefs.adaptiveBitrate = adaptiveSwitch.state == .on
         if sender === chromaControl {
             prefs.chroma = chromaControl.selectedSegment == 1 ? .yuv444 : .yuv420
+        }
+        // Choosing a priority also sets the controls that matter most for it; each can still be changed after.
+        if sender === priorityControl {
+            switch prefs.priority {
+            case .speed: prefs.codec = .h264; prefs.chroma = .yuv420; prefs.fps = .fps60
+            case .quality: prefs.codec = .auto; prefs.chroma = .yuv444; prefs.bitrate = .mbps35; prefs.maxResolution = .native
+            }
+            prefs.save(); syncQualityControls()
+            if isConnected { changedWhileConnected = true; updateQualityNote() }
+            return
         }
         prefs.save()
         updateChromaState(savedChroma: prefs.chroma)

@@ -44,6 +44,9 @@ struct BitrateController {
         return target != old
     }
 }
+// Peak data rate in sixteenths of the average bitrate in bytes: 1.5x (as before 0.16) unless quality
+// priority, which lets a scene change take 2.5x for a sharper first frame at some latency cost.
+func peakSixteenths(_ priority: StreamPriority?) -> Int { priority == .quality ? 5 : 3 }
 final class VideoEncoder {
     static let supportsHardwareHEVC: Bool = {
         var created: VTCompressionSession?
@@ -72,7 +75,7 @@ final class VideoEncoder {
             ? kVTProfileLevel_H264_High_AutoLevel
             : (quality.chroma == .yuv444 ? ("HEVC_Main444_AutoLevel" as CFString) : kVTProfileLevel_HEVC_Main_AutoLevel)
         let avgBitrate = quality.bitrateMbps * 1_000_000
-        let peakBytesPerSecond = quality.bitrateMbps * 187_500 // 1.5x average in bytes/sec
+        let peakBytesPerSecond = quality.bitrateMbps * 1_000_000 * peakSixteenths(quality.priority) / 16 // bytes/sec
         let fps = quality.fps.rawValue
         let keyframes = keyframeInterval(fps: fps, onDemand: onDemandKeyframes)
         let properties: [CFString: Any] = [
@@ -85,7 +88,16 @@ final class VideoEncoder {
             kVTCompressionPropertyKey_MaxKeyFrameInterval: keyframes.frames,
             kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration: keyframes.seconds,
         ]
-        guard VTSessionSetProperties(session, propertyDictionary: properties as CFDictionary) == noErr, VTCompressionSessionPrepareToEncodeFrames(session) == noErr else {
+        guard VTSessionSetProperties(session, propertyDictionary: properties as CFDictionary) == noErr else {
+            VTCompressionSessionInvalidate(session)
+            return nil
+        }
+        // Optional hints, set one by one so an encoder that rejects one still starts.
+        if let priority = quality.priority {
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: (priority == .speed) as CFBoolean)
+            if priority == .speed { VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber) }
+        }
+        guard VTCompressionSessionPrepareToEncodeFrames(session) == noErr else {
             VTCompressionSessionInvalidate(session)
             return nil
         }
@@ -114,7 +126,7 @@ final class VideoEncoder {
     // Live change; both properties are accepted mid-session (measured, output follows within a second).
     func setBitrate(_ bps: Int) {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bps as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: [bps * 3 / 16, 1] as CFArray)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: [bps * peakSixteenths(effectiveQuality.priority) / 16, 1] as CFArray)
     }
     // `timing` (without the encode time) goes into the frame for 0.10 viewers; `capturedAt` is mach host time.
     func encode(_ pixel: CVImageBuffer, time: CMTime, keyframe: Bool, timing: FrameTiming? = nil, capturedAt: UInt64 = 0) -> Bool {
