@@ -363,6 +363,8 @@ extension CursorUpdate.Image {
 }
 // Host: polls the system cursor at 60 Hz while a 0.11 viewer is connected. The seed changes with the
 // shape (~0.04 ms per read); the image is only fetched and encoded when it does (~0.5 ms).
+// Like Parsec, the image and hotspot go out unscaled; the viewer's own Pointer Size setting enlarges it
+// there as it does every cursor. Scaling it here as well moved the arrow tip off the click point.
 // Cursor warps by host apps are not reported; the viewer's own pointer position stays authoritative.
 final class CursorTracker {
     var send: ((CursorUpdate) -> Void)?
@@ -375,19 +377,12 @@ final class CursorTracker {
         timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.tick() }
     }
     func stop() { timer?.invalidate(); timer = nil; seed = nil; shape = nil; sentHash = nil; sentVisible = nil; sentWidth = nil }
-    // Read on each shape change, so a new size applies from the next shape change.
-    static func hostPointerSize() -> Double {
-        CFPreferencesAppSynchronize("com.apple.universalaccess" as CFString)
-        return (CFPreferencesCopyAppValue("mouseDriverCursorSize" as CFString, "com.apple.universalaccess" as CFString) as? NSNumber)?.doubleValue ?? 1
-    }
     private func tick() {
         let s = CGSCurrentCursorSeed()
-        if s != seed, let c = NSCursor.currentSystem, let image = CursorUpdate.Image(cursor: c, pointScale: Self.hostPointerSize()) {
+        if s != seed, let c = NSCursor.currentSystem, let image = CursorUpdate.Image(cursor: c) {
             seed = s; shape = (fnv1a64(image.png), image)
         }
-        let mouse = NSEvent.mouseLocation
-        let width = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }).map { Double($0.frame.width) }
-        guard let shape, let u = CursorUpdate.next(hash: shape.hash, image: shape.image, visible: CGCursorIsVisibleGlobal() != 0, sentHash: sentHash, sentVisible: sentVisible, width: width, sentWidth: sentWidth) else { return }
+        guard let shape, let u = CursorUpdate.next(hash: shape.hash, image: shape.image, visible: CGCursorIsVisibleGlobal() != 0, sentHash: sentHash, sentVisible: sentVisible) else { return }
         sentHash = u.hash; sentVisible = u.visible; sentWidth = u.screenWidth
         send?(u)
     }

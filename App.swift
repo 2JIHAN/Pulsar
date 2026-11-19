@@ -170,16 +170,6 @@ struct RemoteCursor {
     // nil until the host sent a shape; hidden on the host shows a blank cursor here.
     var shown: NSCursor? { current.map { visible ? $0 : Self.blank } }
     mutating func reset() { current = nil; visible = true; screenWidth = nil }
-    // How much wider the host display is drawn here than its own point width, in 5% steps.
-    static func scale(viewWidth: Double?, hostWidth: Double?) -> Double {
-        guard let v = viewWidth, let h = hostWidth, v > 0, h > 0 else { return 1 }
-        return (min(4, max(0.25, v / h)) * 20).rounded() / 20
-    }
-    static func scaled(_ c: NSCursor, _ k: Double) -> NSCursor {
-        let image = c.image.copy() as! NSImage
-        image.size = NSSize(width: c.image.size.width * k, height: c.image.size.height * k)
-        return NSCursor(image: image, hotSpot: NSPoint(x: c.hotSpot.x * k, y: c.hotSpot.y * k))
-    }
     // False for an image that does not decode to its announced size: the connection is closed.
     mutating func apply(_ u: CursorUpdate) -> Bool {
         if let image = u.image, cache[u.hash] == nil {
@@ -735,14 +725,8 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // Only for a host that sends its cursor; others keep this Mac's arrow and the cursor in the video.
     func refreshCursor() {
         guard hostCursor, let c = remoteCursor.shown else { return }
-        guard pointerOverRemote() else { NSCursor.arrow.set(); return }
-        let view = presentation == .screens ? remoteScreen(at: NSEvent.mouseLocation)?.viewer : viewer
-        let k = RemoteCursor.scale(viewWidth: view.map { Double($0.contentRect.width) }, hostWidth: remoteCursor.screenWidth)
-        if c === RemoteCursor.blank || k == 1 { c.set(); return }
-        if scaledCursor?.base !== c || scaledCursor?.k != k { scaledCursor = (c, k, RemoteCursor.scaled(c, k)) }
-        scaledCursor?.cursor.set()
+        (pointerOverRemote() ? c : NSCursor.arrow).set()
     }
-    var scaledCursor: (base: NSCursor, k: Double, cursor: NSCursor)?
     // While local, only the edge the pointer came back through leads into the remote screens again.
     func localEdge(_ e: NSEvent) {
         guard presentation == .local, inSession, let key = localPortal else { return }

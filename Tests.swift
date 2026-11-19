@@ -1069,9 +1069,6 @@ func cursorTests() throws {
     var lie = first; lie.image = lying
     require(!remote.apply(lie.image.map { CursorUpdate(visible: true, hash: "00000000000000bb", image: $0) }!), "undecodable image closes the connection")
     require(remote.apply(CursorUpdate(visible: true, hash: hash, screenWidth: 1512)) && remote.screenWidth == 1512, "host display width kept")
-    require(RemoteCursor.scale(viewWidth: 1512, hostWidth: 1512) == 1 && RemoteCursor.scale(viewWidth: 1512, hostWidth: 2560) == 0.6 && RemoteCursor.scale(viewWidth: 1512, hostWidth: 1000) == 1.5 && RemoteCursor.scale(viewWidth: nil, hostWidth: 1512) == 1, "cursor follows the drawn size of the host display")
-    let big2 = RemoteCursor.scaled(cached!, 1.5)
-    require(big2.image.size.width == cached!.image.size.width * 1.5 && big2.hotSpot.x == cached!.hotSpot.x * 1.5, "scaled cursor keeps proportions and hotspot")
     require(CursorUpdate.next(hash: hash, image: ibeam, visible: true, sentHash: hash, sentVisible: true, width: 1512, sentWidth: 2560) == CursorUpdate(visible: true, hash: hash, screenWidth: 1512), "display change resends width without image")
     require(CursorUpdate.decodeWire(CursorUpdate(visible: true, hash: hash, screenWidth: .infinity).wireMessage()) == nil && CursorUpdate.decodeWire(CursorUpdate(visible: true, hash: hash, screenWidth: 10).wireMessage()) == nil, "bad host width rejected")
     remote.reset(); require(remote.shown == nil && remote.cache.count == 1 && remote.screenWidth == nil, "reset on reconnect keeps the cache")
