@@ -417,7 +417,10 @@ final class CursorTracker {
         }
         // Always visible: the host reports "hidden" while it hides the cursor until the mouse moves (after
         // typing), and remote moves do not always end that, which left the viewer with no cursor at all.
-        guard let shape, let u = CursorUpdate.next(hash: shape.hash, image: shape.image, visible: true, sentHash: sentHash, sentVisible: sentVisible) else { return }
+        // Point width of the screen under the cursor: the viewer sizes image cursors by how wide it draws that screen.
+        let mouse = NSEvent.mouseLocation
+        let width = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }).map { Double($0.frame.width) }
+        guard let shape, let u = CursorUpdate.next(hash: shape.hash, image: shape.image, visible: true, sentHash: sentHash, sentVisible: sentVisible, width: width, sentWidth: sentWidth) else { return }
         sentHash = u.hash; sentVisible = u.visible; sentWidth = u.screenWidth
         send?(u)
     }

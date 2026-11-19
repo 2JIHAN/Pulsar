@@ -169,19 +169,31 @@ struct RemoteCursor {
     private(set) var current: NSCursor?
     private(set) var visible = true
     private(set) var screenWidth: Double?
+    // Image of the current app-made (non-standard) shape; refreshCursor sizes it to the view, like Parsec.
+    private(set) var images = [String: CursorUpdate.Image]()
+    private(set) var currentImage: (hash: String, image: CursorUpdate.Image)?
     // nil until the host sent a shape; hidden on the host shows a blank cursor here.
     var shown: NSCursor? { current.map { visible ? $0 : Self.blank } }
-    mutating func reset() { current = nil; visible = true; screenWidth = nil }
+    mutating func reset() { current = nil; visible = true; screenWidth = nil; currentImage = nil }
+    // Parsec (parsecd 150-105c, client cursor path at 0x18f9xx): an image cursor is drawn at the size it has in
+    // the video, i.e. host size x (drawn screen width / host screen width), and snapped to the image's own size
+    // or half of it when within ~1 pt so it stays sharp. Hotspot scales with it.
+    static func parsecScale(width: Double, viewWidth: Double?, hostWidth: Double?) -> Double {
+        guard let v = viewWidth, let h = hostWidth, v > 0, h > 0, width > 0 else { return 1 }
+        let target = width * min(4, max(0.25, v / h))
+        if abs(target - width) <= 1.5 { return 1 }
+        if abs(target - width / 2) <= 1.5 { return 0.5 }
+        return target / width
+    }
     // False for an image that does not decode to its announced size: the connection is closed.
     mutating func apply(_ u: CursorUpdate) -> Bool {
         if let image = u.image, cache[u.hash] == nil {
-            // App-made cursors: Parsec shows the host's largest image (2x of the Pointer Size image) at its pixel
-            // size in points; at Pointer Size alone they looked under half that size here, so match Parsec.
-            guard let c = image.cursor(scale: 2 * max(systemCursorScale(), image.pointerScale ?? 1)) else { return false }
-            if cache.count >= 32 { cache.removeAll() }
+            guard let c = image.cursor() else { return false }
+            if cache.count >= 32 { cache.removeAll(); images.removeAll() }
             cache[u.hash] = c
+            if image.system == nil { images[u.hash] = image }
         }
-        if let c = cache[u.hash] { current = c }
+        if let c = cache[u.hash] { current = c; currentImage = images[u.hash].map { (u.hash, $0) } }
         visible = u.visible
         if let w = u.screenWidth { screenWidth = w }
         return true
@@ -729,8 +741,14 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // Only for a host that sends its cursor; others keep this Mac's arrow and the cursor in the video.
     func refreshCursor() {
         guard hostCursor, let c = remoteCursor.shown else { return }
-        (pointerOverRemote() ? c : NSCursor.arrow).set()
+        guard pointerOverRemote() else { NSCursor.arrow.set(); return }
+        guard c !== RemoteCursor.blank, let (hash, image) = remoteCursor.currentImage else { c.set(); return }
+        let view = presentation == .screens ? remoteScreen(at: NSEvent.mouseLocation)?.viewer : viewer
+        let k = RemoteCursor.parsecScale(width: image.width, viewWidth: view.map { Double($0.contentRect.width) }, hostWidth: remoteCursor.screenWidth)
+        if sizedCursor?.hash != hash || sizedCursor?.k != k { sizedCursor = (hash, k, k == 1 ? c : image.cursor(scale: k) ?? c) }
+        sizedCursor?.cursor.set()
     }
+    var sizedCursor: (hash: String, k: Double, cursor: NSCursor)?
     // While local, only the edge the pointer came back through leads into the remote screens again.
     func localEdge(_ e: NSEvent) {
         guard presentation == .local, inSession, let key = localPortal else { return }
