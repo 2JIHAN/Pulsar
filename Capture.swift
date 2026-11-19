@@ -369,12 +369,12 @@ final class CursorTracker {
     private var timer: Timer?
     private var seed: Int32?
     private var shape: (hash: String, image: CursorUpdate.Image)?
-    private var sentHash: String?, sentVisible: Bool?
+    private var sentHash: String?, sentVisible: Bool?, sentWidth: Double?
     func start() {
         stop()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.tick() }
     }
-    func stop() { timer?.invalidate(); timer = nil; seed = nil; shape = nil; sentHash = nil; sentVisible = nil }
+    func stop() { timer?.invalidate(); timer = nil; seed = nil; shape = nil; sentHash = nil; sentVisible = nil; sentWidth = nil }
     // Read on each shape change, so a new size applies from the next shape change.
     static func hostPointerSize() -> Double {
         CFPreferencesAppSynchronize("com.apple.universalaccess" as CFString)
@@ -385,8 +385,10 @@ final class CursorTracker {
         if s != seed, let c = NSCursor.currentSystem, let image = CursorUpdate.Image(cursor: c, pointScale: Self.hostPointerSize()) {
             seed = s; shape = (fnv1a64(image.png), image)
         }
-        guard let shape, let u = CursorUpdate.next(hash: shape.hash, image: shape.image, visible: CGCursorIsVisibleGlobal() != 0, sentHash: sentHash, sentVisible: sentVisible) else { return }
-        sentHash = u.hash; sentVisible = u.visible
+        let mouse = NSEvent.mouseLocation
+        let width = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }).map { Double($0.frame.width) }
+        guard let shape, let u = CursorUpdate.next(hash: shape.hash, image: shape.image, visible: CGCursorIsVisibleGlobal() != 0, sentHash: sentHash, sentVisible: sentVisible, width: width, sentWidth: sentWidth) else { return }
+        sentHash = u.hash; sentVisible = u.visible; sentWidth = u.screenWidth
         send?(u)
     }
 }
@@ -397,6 +399,7 @@ final class InputInjector {
     // The DockSwipe stream being replayed; cancelled by release() so Dock is not left mid-swipe.
     private(set) var dock: DockGesture?
     private func post(_ event: CGEvent?) { if let event = event { postEvent(event) } }
+    private var lastClick: (button: UInt16, time: TimeInterval, point: CGPoint, count: Int64)?
     // Host display bounds per viewer screen id. Each stream maps 0...1 into its own display.
     var rects = [Int: CGRect]()
     var keys = Set<UInt16>()
@@ -425,6 +428,14 @@ final class InputInjector {
             if down { buttons.insert(m.code) } else { buttons.remove(m.code) }
             let type: CGEventType = m.code == 0 ? (down ? .leftMouseDown : .leftMouseUp) : m.code == 1 ? (down ? .rightMouseDown : .rightMouseUp) : (down ? .otherMouseDown : .otherMouseUp)
             event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: CGMouseButton(rawValue: UInt32(m.code))!)
+            // Without a click state every click is a single click, so double and triple clicks never register.
+            // Counted here from arrival time and position so viewers of any version get them.
+            if down {
+                let now = ProcessInfo.processInfo.systemUptime
+                let again = lastClick.map { $0.button == m.code && now - $0.time <= NSEvent.doubleClickInterval && hypot($0.point.x - point.x, $0.point.y - point.y) <= 4 } ?? false
+                lastClick = (m.code, now, point, again ? lastClick!.count + 1 : 1)
+            }
+            event?.setIntegerValueField(.mouseEventClickState, value: lastClick?.button == m.code ? lastClick!.count : 1)
             lastPoint = point
         case .scroll:
             event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: Int32(m.dy), wheel2: Int32(m.dx), wheel3: 0)

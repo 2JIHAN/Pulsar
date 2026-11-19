@@ -739,17 +739,21 @@ struct CursorUpdate: Codable, Equatable {
     var visible: Bool
     var hash: String
     var image: Image? = nil
+    // 0.13+: point width of the host display under the cursor. The viewer scales the cursor by how wide
+    // that display is drawn here, so it keeps the size it has in the video (Parsec sends a host-pixel image).
+    var screenWidth: Double? = nil
     func wireMessage() -> Data { Data([Self.messageType]) + ((try? JSONEncoder().encode(self)) ?? Data()) }
     static func decodeWire(_ data: Data) -> CursorUpdate? {
         guard data.first == messageType, data.count > 1, data.count <= maxWireBytes,
               let u = try? JSONDecoder().decode(CursorUpdate.self, from: data.dropFirst()),
-              u.hash.count == 16, u.hash.allSatisfy({ $0.isHexDigit && $0.isASCII }), u.image?.valid ?? true else { return nil }
+              u.hash.count == 16, u.hash.allSatisfy({ $0.isHexDigit && $0.isASCII }), u.image?.valid ?? true,
+              u.screenWidth.map({ $0.isFinite && (64...20000).contains($0) }) ?? true else { return nil }
         return u
     }
     // Host side: nil when the viewer already shows this shape and visibility.
-    static func next(hash: String, image: Image, visible: Bool, sentHash: String?, sentVisible: Bool?) -> CursorUpdate? {
-        if hash != sentHash { return CursorUpdate(visible: visible, hash: hash, image: image) }
-        return visible == sentVisible ? nil : CursorUpdate(visible: visible, hash: hash)
+    static func next(hash: String, image: Image, visible: Bool, sentHash: String?, sentVisible: Bool?, width: Double? = nil, sentWidth: Double? = nil) -> CursorUpdate? {
+        if hash != sentHash { return CursorUpdate(visible: visible, hash: hash, image: image, screenWidth: width) }
+        return visible == sentVisible && width == sentWidth ? nil : CursorUpdate(visible: visible, hash: hash, screenWidth: width)
     }
 }
 func fnv1a64(_ data: Data) -> String {

@@ -58,6 +58,7 @@ func runSelfTests() {
         try gestureTests(injector: injector)
         try cursorTests()
         updaterTests()
+        clickCountTests()
         try dockGestureTests()
         sessionTests(decoded)
         var pushes = 0, pops = [UnsafeMutableRawPointer]()
@@ -1067,7 +1068,13 @@ func cursorTests() throws {
     require(remote.apply(first) && remote.cache[hash] === cached, "a resent known shape reuses the cached cursor")
     var lie = first; lie.image = lying
     require(!remote.apply(lie.image.map { CursorUpdate(visible: true, hash: "00000000000000bb", image: $0) }!), "undecodable image closes the connection")
-    remote.reset(); require(remote.shown == nil && remote.cache.count == 1, "reset on reconnect keeps the cache")
+    require(remote.apply(CursorUpdate(visible: true, hash: hash, screenWidth: 1512)) && remote.screenWidth == 1512, "host display width kept")
+    require(RemoteCursor.scale(viewWidth: 1512, hostWidth: 1512) == 1 && RemoteCursor.scale(viewWidth: 1512, hostWidth: 2560) == 0.6 && RemoteCursor.scale(viewWidth: 1512, hostWidth: 1000) == 1.5 && RemoteCursor.scale(viewWidth: nil, hostWidth: 1512) == 1, "cursor follows the drawn size of the host display")
+    let big2 = RemoteCursor.scaled(cached!, 1.5)
+    require(big2.image.size.width == cached!.image.size.width * 1.5 && big2.hotSpot.x == cached!.hotSpot.x * 1.5, "scaled cursor keeps proportions and hotspot")
+    require(CursorUpdate.next(hash: hash, image: ibeam, visible: true, sentHash: hash, sentVisible: true, width: 1512, sentWidth: 2560) == CursorUpdate(visible: true, hash: hash, screenWidth: 1512), "display change resends width without image")
+    require(CursorUpdate.decodeWire(CursorUpdate(visible: true, hash: hash, screenWidth: .infinity).wireMessage()) == nil && CursorUpdate.decodeWire(CursorUpdate(visible: true, hash: hash, screenWidth: 10).wireMessage()) == nil, "bad host width rejected")
+    remote.reset(); require(remote.shown == nil && remote.cache.count == 1 && remote.screenWidth == nil, "reset on reconnect keeps the cache")
     print("PASS cursor: showsCursor off only for cursor-capable viewers, CursorUpdate roundtrip (\(wire.count) bytes) and \(bad.count + 1) malformed updates rejected, shape/visibility dedupe, 2x render capped at 256 px, viewer keeps host point size/hotspot, hidden -> blank, cache by hash")
 
     if let c = NSCursor.currentSystem, let live = CursorUpdate.Image(cursor: c) {
@@ -1174,4 +1181,17 @@ func updaterTests() {
     require(AutoUpdate.newest([r("v0.11.0"), r("v0.13.0", draft: true), r("v0.12.0"), r("v0.10.0")], current: "0.11.1")?.version == "0.12.0", "newest non-draft newer release chosen")
     require(AutoUpdate.newest([r("v0.12.0", asset: "Other.zip"), r("v0.11.1")], current: "0.11.1") == nil, "no update without the app zip or when current")
     require(AutoUpdate.prepare(zip: URL(fileURLWithPath: "/nonexistent.zip"), version: "0.12.0") == nil, "unreadable download refused")
+}
+
+func clickCountTests() {
+    var states = [Int64]()
+    let inj = InputInjector(); inj.postEvent = { e in if e.type == .leftMouseDown || e.type == .leftMouseUp { states.append(e.getIntegerValueField(.mouseEventClickState)) } }
+    inj.rects[0] = CGRect(x: 0, y: 0, width: 1000, height: 1000)
+    func click(_ x: Double) { for k in [InputMessage.Kind.down, .up] { var m = InputMessage(kind: k, x: x, y: 0.5); m.screen = 0; inj.apply(m) } }
+    click(0.5); click(0.5); click(0.5)
+    precondition(states == [1, 1, 2, 2, 3, 3], "FAIL click state \(states)")
+    states.removeAll(); Thread.sleep(forTimeInterval: NSEvent.doubleClickInterval + 0.05); click(0.5); click(0.6)
+    precondition(states == [1, 1, 1, 1], "FAIL click state after pause/move \(states)")
+    inj.release()
+    print("PASS click state: quick clicks at one spot count 1, 2, 3 on down and up; a pause or a moved click starts over")
 }
