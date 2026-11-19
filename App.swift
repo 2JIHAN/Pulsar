@@ -389,7 +389,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func buildWindow() {
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 720), styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         window.title = "Pulsar"; window.titleVisibility = .hidden; window.titlebarAppearsTransparent = true; window.titlebarSeparatorStyle = .none
-        window.delegate = self; window.minSize = NSSize(width: 960, height: 600)
+        window.delegate = self; window.minSize = NSSize(width: 960, height: 600); window.isReleasedWhenClosed = false
         let found = localAddresses().sorted { rank($0) < rank($1) }; ips = found.map { $0.1 }; addresses.addItems(withTitles: found.map { $0.0 }); if ips.isEmpty { ips = ["127.0.0.1"]; addresses.addItem(withTitle: "로컬 테스트 127.0.0.1") }
         hostButton.target = self; hostButton.action = #selector(toggleHost)
         allowAccess.target = self; allowAccess.action = #selector(allowAccessChanged)
@@ -657,7 +657,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     @objc func returnToRemote() { guard inSession else { return }; wantsScreens = true; presentScreens() }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        guard inSession, presentation == .local else { return true }
+        guard inSession, presentation == .local else { if !flag { window.makeKeyAndOrderFront(nil) }; return true }
         presentScreens(); return false
     }
     static func pointerKind(_ type: NSEvent.EventType) -> InputMessage.Kind? {
@@ -1102,6 +1102,11 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         refreshHostState(); statusText = "공유를 중지했습니다."
     }
     @objc func stopAll() { stopHost(); disconnectViewer(); statusText = "모든 연결을 중지했습니다. 새로 공유하면 새 비밀키를 만듭니다." }
-    func windowWillClose(_ notification: Notification) { if (notification.object as? NSWindow) === window { NSApp.terminate(nil) } }
+    // Closing the main window keeps Pulsar running so this Mac stays reachable; quit only with ⌘Q.
+    // During a session the close button ends the session instead, which brings the window back.
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard sender === window, inSession else { return true }
+        disconnectViewer(); return false
+    }
     func applicationWillTerminate(_ notification: Notification) { stopAll(); timer?.invalidate(); uiTimer?.invalidate(); deviceTimer?.invalidate() }
 }
