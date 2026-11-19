@@ -185,8 +185,8 @@ struct RemoteCursor {
         return longest > 0 ? min(k, 256 / longest) : k
     }
     static var userScale: Double {
-        let v = UserDefaults.standard.object(forKey: scaleKey) as? Double ?? 2
-        return v.isFinite ? min(4, max(0.5, v)) : 2
+        let v = UserDefaults.standard.object(forKey: scaleKey) as? Double ?? 1
+        return v.isFinite ? min(4, max(0.5, v)) : 1
     }
     // False for an image that does not decode to its announced size: the connection is closed.
     mutating func apply(_ u: CursorUpdate) -> Bool {

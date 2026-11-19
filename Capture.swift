@@ -372,9 +372,11 @@ extension CursorUpdate.Image {
         let scale = Self.renderScale(width: size.width, height: size.height)
         let pw = max(1, Int((size.width * scale).rounded())), ph = max(1, Int((size.height * scale).rounded()))
         guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: pw, pixelsHigh: ph, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
-                                         isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
-              let context = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+                                         isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+        // The point size must be set before the context is made: the context takes its scale from it, and a
+        // context made first drew the cursor into only the lower-left 1/scale of the bitmap.
         rep.size = size
+        guard let context = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
         NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = context
         cursor.image.draw(in: NSRect(origin: .zero, size: size))
         NSGraphicsContext.restoreGraphicsState()
@@ -392,9 +394,9 @@ extension CursorUpdate.Image {
         let size = NSSize(width: width * scale, height: height * scale)
         rep.size = NSSize(width: width, height: height)
         guard let out = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: max(1, Int((size.width * 2).rounded())), pixelsHigh: max(1, Int((size.height * 2).rounded())),
-                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
-              let context = NSGraphicsContext(bitmapImageRep: out) else { return nil }
-        out.size = size
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+        out.size = size   // before the context, as in init(cursor:)
+        guard let context = NSGraphicsContext(bitmapImageRep: out) else { return nil }
         NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = context
         rep.draw(in: NSRect(origin: .zero, size: size))
         NSGraphicsContext.restoreGraphicsState()
