@@ -124,9 +124,11 @@ final class Viewer: NSView {
     // NSEvent raises if scrollingDelta is read from a non-scroll event, which crashed the viewer on the first click.
     static func inputMessage(_ e: NSEvent, _ kind: InputMessage.Kind, point p: NSPoint, rect r: NSRect) -> InputMessage {
         let scroll = kind == .scroll
-        return InputMessage(kind: kind, x: min(1, max(0, (p.x-r.minX)/r.width)), y: min(1, max(0, (p.y-r.minY)/r.height)),
+        var m = InputMessage(kind: kind, x: min(1, max(0, (p.x-r.minX)/r.width)), y: min(1, max(0, (p.y-r.minY)/r.height)),
             code: scroll ? 0 : UInt16(min(2, max(0, e.buttonNumber))), flags: UInt64(e.modifierFlags.rawValue),
             dx: scroll ? min(1000, max(-1000, Double(e.scrollingDeltaX))) : 0, dy: scroll ? min(1000, max(-1000, Double(e.scrollingDeltaY))) : 0)
+        if scroll, !e.hasPreciseScrollingDeltas { m.lines = true }
+        return m
     }
     override func mouseDown(with e: NSEvent) { window?.makeFirstResponder(self); mouse(e, .down) }
     override func mouseUp(with e: NSEvent) { mouse(e, .up) }

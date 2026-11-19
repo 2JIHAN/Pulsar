@@ -59,6 +59,7 @@ func runSelfTests() {
         try cursorTests()
         updaterTests()
         clickCountTests()
+        scrollAndStandardCursorTests()
         try dockGestureTests()
         sessionTests(decoded)
         var pushes = 0, pops = [UnsafeMutableRawPointer]()
@@ -1196,4 +1197,26 @@ func clickCountTests() {
     precondition(states == [1, 1, 1, 1], "FAIL click state after pause/move \(states)")
     inj.release()
     print("PASS click state: quick clicks at one spot count 1, 2, 3 on down and up; a pause or a moved click starts over")
+}
+
+func scrollAndStandardCursorTests() {
+    var got = [(line: Int64, point: Int64, continuous: Int64)]()
+    let inj = InputInjector(); inj.postEvent = { e in if e.type == .scrollWheel { got.append((e.getIntegerValueField(.scrollWheelEventDeltaAxis1), e.getIntegerValueField(.scrollWheelEventPointDeltaAxis1), e.getIntegerValueField(.scrollWheelEventIsContinuous))) } }
+    inj.rects[0] = CGRect(x: 0, y: 0, width: 1000, height: 1000)
+    func scroll(_ dy: Double, lines: Bool?) { var m = InputMessage(kind: .scroll, x: 0.5, y: 0.5, dy: dy); m.screen = 0; m.lines = lines; inj.apply(m) }
+    scroll(1, lines: true); scroll(-3, lines: true)
+    precondition(got.count == 2 && got[0].line == 1 && got[0].continuous == 0 && got[1].line == -3, "FAIL wheel lines \(got)")
+    got.removeAll(); for _ in 0..<4 { scroll(0.5, lines: nil) }
+    precondition(got.map(\.continuous).allSatisfy { $0 == 1 } && got.map(\.point).reduce(0, +) == 2, "FAIL fractional pixels carried \(got)")
+    for (name, c) in standardCursors {
+        guard let image = CursorUpdate.Image(cursor: c) else { continue }
+        precondition(CursorTracker.standardByHash[fnv1a64(image.png)] != nil, "FAIL standard cursor \(name) not matched")
+        var named = image; named.system = name
+        precondition(named.cursor(scale: 1.7) === c, "FAIL viewer uses its own \(name)")
+    }
+    var custom = CursorUpdate.Image(cursor: NSCursor(image: NSImage(size: NSSize(width: 20, height: 20), flipped: false) { r in NSColor.red.setFill(); r.fill(); return true }, hotSpot: NSPoint(x: 2, y: 3)))!
+    custom.system = nil
+    let big = custom.cursor(scale: 1.5)!, rep = big.image.representations.first as? NSBitmapImageRep
+    precondition(big.image.size.width == 30 && rep?.pixelsWide == 60 && big.hotSpot == NSPoint(x: 3, y: 4.5), "FAIL custom cursor density")
+    print("PASS wheel: notched wheel posts line deltas, trackpad pixels keep fractions and are continuous; \(standardCursors.count) standard cursors matched and shown natively; custom cursor scaled at 2x pixels")
 }

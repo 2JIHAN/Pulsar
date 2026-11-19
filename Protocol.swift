@@ -65,6 +65,8 @@ struct InputMessage: Codable {
     var build: String? = nil
     // Client screen whose stream the coordinates belong to. 0.8 viewers omit it and mean stream 0.
     var screen: Int? = nil
+    // Scroll only, 0.14+: a notched mouse wheel (deltas in lines). Absent means pixel deltas, as before.
+    var lines: Bool? = nil
     static let gestureDataLimit = 64 * 1024
     var valid: Bool {
         guard x.isFinite && y.isFinite && (0...1).contains(x) && (0...1).contains(y) && dx.isFinite && dy.isFinite && abs(dx) <= 1000 && abs(dy) <= 1000 && code <= 255,
@@ -731,6 +733,9 @@ struct CursorUpdate: Codable, Equatable {
         // 0.13.2+: the host's Pointer Size (WindowServer cursor scale). macOS applies that setting only to
         // system cursors, not to an app's own NSCursor, so the viewer applies it itself.
         var pointerScale: Double? = nil
+        // 0.14+: name of a standard AppKit cursor this image matches. The viewer shows its own copy of that
+        // cursor, which macOS draws at the viewer's Pointer Size like any system cursor (Parsec does the same).
+        var system: String? = nil
         var valid: Bool {
             func ratio(_ px: Int, _ pt: Double) -> Bool { (0.5...4).contains(Double(px) / pt) }
             return (1...CursorUpdate.maxPixels).contains(pixelWidth) && (1...CursorUpdate.maxPixels).contains(pixelHeight)
@@ -738,6 +743,7 @@ struct CursorUpdate: Codable, Equatable {
                 && [width, height, hotX, hotY].allSatisfy(\.isFinite) && width >= 1 && height >= 1 && ratio(pixelWidth, width) && ratio(pixelHeight, height)
                 && (0...width).contains(hotX) && (0...height).contains(hotY)
                 && (pointerScale.map { $0.isFinite && (0.5...8).contains($0) } ?? true)
+                && (system.map { (1...40).contains($0.count) && $0.allSatisfy { $0.isASCII && $0.isLetter } } ?? true)
         }
     }
     var visible: Bool

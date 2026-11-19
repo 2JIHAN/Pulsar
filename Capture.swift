@@ -336,6 +336,14 @@ func systemCursorScale() -> Double {
 // state: measured 0 while another process hid the cursor or it was hidden until the mouse moves, 1 otherwise.
 @_silgen_name("CGCursorIsVisible") private func CGCursorIsVisibleGlobal() -> Int32
 
+// Standard AppKit cursors, matched by rendered image on the host and recreated natively on the viewer.
+let standardCursors: [String: NSCursor] = [
+    "arrow": .arrow, "iBeam": .iBeam, "pointingHand": .pointingHand, "openHand": .openHand, "closedHand": .closedHand,
+    "crosshair": .crosshair, "resizeLeftRight": .resizeLeftRight, "resizeUpDown": .resizeUpDown, "resizeLeft": .resizeLeft,
+    "resizeRight": .resizeRight, "resizeUp": .resizeUp, "resizeDown": .resizeDown, "operationNotAllowed": .operationNotAllowed,
+    "dragCopy": .dragCopy, "dragLink": .dragLink, "contextualMenu": .contextualMenu, "disappearingItem": .disappearingItem,
+    "iBeamVertical": .iBeamCursorForVerticalLayout,
+]
 extension CursorUpdate.Image {
     // At most 2x and at most 256 px on the long side; a 1x viewer screen downsamples.
     static func renderScale(width: Double, height: Double) -> Double { min(2, Double(CursorUpdate.maxPixels) / max(1, width, height)) }
@@ -362,10 +370,21 @@ extension CursorUpdate.Image {
     }
     // Viewer side. nil when the PNG does not decode to the announced pixel size.
     // `scale` enlarges image and hotspot together, so the arrow tip stays on the click point.
+    // A standard cursor comes back as this Mac's own; others are redrawn at 2x pixels for the scaled size,
+    // because macOS sizes a cursor from its pixels per point rather than the image's point size alone.
     func cursor(scale: Double = 1) -> NSCursor? {
         guard valid, let rep = NSBitmapImageRep(data: png), rep.pixelsWide == pixelWidth, rep.pixelsHigh == pixelHeight else { return nil }
-        rep.size = NSSize(width: width * scale, height: height * scale)
-        let image = NSImage(size: rep.size); image.addRepresentation(rep)
+        if let system, let c = standardCursors[system] { return c }
+        let size = NSSize(width: width * scale, height: height * scale)
+        rep.size = NSSize(width: width, height: height)
+        guard let out = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: max(1, Int((size.width * 2).rounded())), pixelsHigh: max(1, Int((size.height * 2).rounded())),
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+              let context = NSGraphicsContext(bitmapImageRep: out) else { return nil }
+        out.size = size
+        NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = context
+        rep.draw(in: NSRect(origin: .zero, size: size))
+        NSGraphicsContext.restoreGraphicsState()
+        let image = NSImage(size: size); image.addRepresentation(out)
         return NSCursor(image: image, hotSpot: NSPoint(x: hotX * scale, y: hotY * scale))
     }
 }
@@ -375,6 +394,8 @@ extension CursorUpdate.Image {
 // there as it does every cursor. Scaling it here as well moved the arrow tip off the click point.
 // Cursor warps by host apps are not reported; the viewer's own pointer position stays authoritative.
 final class CursorTracker {
+    static let standardByHash: [String: String] = Dictionary(standardCursors.compactMap { name, c in
+        CursorUpdate.Image(cursor: c).map { (fnv1a64($0.png), name) } }, uniquingKeysWith: { a, _ in a })
     var send: ((CursorUpdate) -> Void)?
     private var timer: Timer?
     private var seed: Int32?
@@ -389,9 +410,13 @@ final class CursorTracker {
         let s = CGSCurrentCursorSeed()
         if s != seed, let c = NSCursor.currentSystem, var image = CursorUpdate.Image(cursor: c) {
             image.pointerScale = systemCursorScale()
-            seed = s; shape = (fnv1a64(image.png), image)
+            let hash = fnv1a64(image.png)
+            image.system = Self.standardByHash[hash]
+            seed = s; shape = (hash, image)
         }
-        guard let shape, let u = CursorUpdate.next(hash: shape.hash, image: shape.image, visible: CGCursorIsVisibleGlobal() != 0, sentHash: sentHash, sentVisible: sentVisible) else { return }
+        // Always visible: the host reports "hidden" while it hides the cursor until the mouse moves (after
+        // typing), and remote moves do not always end that, which left the viewer with no cursor at all.
+        guard let shape, let u = CursorUpdate.next(hash: shape.hash, image: shape.image, visible: true, sentHash: sentHash, sentVisible: sentVisible) else { return }
         sentHash = u.hash; sentVisible = u.visible; sentWidth = u.screenWidth
         send?(u)
     }
@@ -404,6 +429,7 @@ final class InputInjector {
     private(set) var dock: DockGesture?
     private func post(_ event: CGEvent?) { if let event = event { postEvent(event) } }
     private var lastClick: (button: UInt16, time: TimeInterval, point: CGPoint, count: Int64)?
+    private var scrollRest: (lines: Bool, dx: Double, dy: Double) = (false, 0, 0)
     // Host display bounds per viewer screen id. Each stream maps 0...1 into its own display.
     var rects = [Int: CGRect]()
     var keys = Set<UInt16>()
@@ -442,7 +468,16 @@ final class InputInjector {
             event?.setIntegerValueField(.mouseEventClickState, value: lastClick?.button == m.code ? lastClick!.count : 1)
             lastPoint = point
         case .scroll:
-            event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: Int32(m.dy), wheel2: Int32(m.dx), wheel3: 0)
+            // Notched wheels scroll by lines (sending their line deltas as pixels moved 1 px per notch).
+            // Trackpad pixel deltas are fractional; the remainder carries over instead of being dropped.
+            let lines = m.lines == true
+            scrollRest = (lines == scrollRest.lines ? scrollRest : (lines, 0, 0))
+            scrollRest.dx += m.dx; scrollRest.dy += m.dy
+            var wx = Int32(scrollRest.dx), wy = Int32(scrollRest.dy)
+            if lines, wx == 0, wy == 0 { wx = m.dx > 0 ? 1 : m.dx < 0 ? -1 : 0; wy = m.dy > 0 ? 1 : m.dy < 0 ? -1 : 0 }
+            scrollRest.dx -= Double(wx); scrollRest.dy -= Double(wy)
+            event = CGEvent(scrollWheelEvent2Source: nil, units: lines ? .line : .pixel, wheelCount: 2, wheel1: wy, wheel2: wx, wheel3: 0)
+            event?.setIntegerValueField(.scrollWheelEventIsContinuous, value: lines ? 0 : 1)
             event?.location = point
         case .keyDown, .keyUp:
             if m.kind == .keyDown { keys.insert(m.code) } else { keys.remove(m.code) }
