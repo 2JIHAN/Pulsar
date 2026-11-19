@@ -51,22 +51,30 @@ final class Updater {
         timer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in self?.check() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in self?.check() }
     }
-    func check() {
-        guard AutoUpdate.enabled, !busy, idle(), let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String else { return }
-        busy = true
+    // `report` is set by the settings button: it checks even with auto update off and shows each outcome.
+    func check(report: ((String) -> Void)? = nil) {
+        let manual = report != nil
+        guard !busy, manual || AutoUpdate.enabled, manual || idle(),
+              let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String else { if manual, busy { report?("확인하는 중입니다…") }; return }
+        busy = true; report?("확인하는 중…")
+        let done: (String?, URL?) -> Void = { [weak self] text, app in
+            DispatchQueue.main.async { self?.busy = false; if let text { report?(text) }; if let app { self?.install(app, manual: manual) } }
+        }
         var req = URLRequest(url: AutoUpdate.releasesURL); req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
-            guard let data, let list = try? JSONDecoder().decode([AutoUpdate.Release].self, from: data),
-                  let new = AutoUpdate.newest(list, current: current) else { DispatchQueue.main.async { self?.busy = false }; return }
+            guard let data, let list = try? JSONDecoder().decode([AutoUpdate.Release].self, from: data) else { return done("확인하지 못했습니다. 네트워크를 확인해 주세요.", nil) }
+            guard let new = AutoUpdate.newest(list, current: current) else { return done("최신 버전입니다 (\(current)).", nil) }
+            guard DispatchQueue.main.sync(execute: { self?.idle() ?? false }) else { return done("새 버전 \(new.version)이 있습니다. 원격 연결을 끝낸 뒤 설치됩니다.", nil) }
+            DispatchQueue.main.async { report?("\(new.version) 내려받는 중…") }
             URLSession.shared.downloadTask(with: new.zip) { file, _, _ in
-                let app = file.flatMap { AutoUpdate.prepare(zip: $0, version: new.version) }
-                DispatchQueue.main.async { self?.busy = false; if let app { self?.install(app) } }
+                guard let app = file.flatMap({ AutoUpdate.prepare(zip: $0, version: new.version) }) else { return done("새 버전을 확인하지 못해 설치하지 않았습니다.", nil) }
+                done("\(new.version) 설치 후 다시 엽니다…", app)
             }.resume()
         }.resume()
     }
     // A detached shell swaps the bundle after this process exits, restores the old one on failure, then reopens.
-    private func install(_ app: URL) {
-        guard AutoUpdate.enabled, idle() else { return }   // re-checked at the next hourly check
+    private func install(_ app: URL, manual: Bool) {
+        guard manual || AutoUpdate.enabled, idle() else { return }   // re-checked at the next hourly check
         let dest = Bundle.main.bundlePath, old = app.deletingLastPathComponent().appendingPathComponent("old.app").path
         let script = "while kill -0 \(getpid()) 2>/dev/null; do sleep 0.2; done; mv \"$2\" \"$3\" && { /usr/bin/ditto \"$1\" \"$2\" || { rm -rf \"$2\"; mv \"$3\" \"$2\"; }; }; open \"$2\""
         let p = Process(); p.executableURL = URL(fileURLWithPath: "/bin/sh"); p.arguments = ["-c", script, "sh", app.path, dest, old]

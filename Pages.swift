@@ -553,6 +553,8 @@ final class SettingsPage: NSObject {
     let preventSleep: NSSwitch
     let loginItem = NSSwitch()
     let autoUpdate = NSSwitch()
+    let updateNote = label("", 11, .regular, Palette.secondary)
+    var onCheckUpdate: (() -> Void)?
     let loginNote = label("", 11, .regular, Palette.secondary)
     let keyNote = label("", 11, .regular, Palette.secondary)
     let codecPopup = NSPopUpButton()
@@ -581,6 +583,7 @@ final class SettingsPage: NSObject {
             settingRow("잠자기 방지", "원격 접속을 기다리는 동안 Mac이 잠들지 않도록 유지합니다.", [preventSleep]),
             settingRow("로그인 시 Pulsar 실행", nil, [loginNote, loginItem]),
             settingRow("자동 업데이트", "새 버전이 나오면 원격 연결이 없을 때 내려받아 설치하고 Pulsar를 다시 엽니다.", [autoUpdate]),
+            settingRow("업데이트 확인", "지금 새 버전을 찾고, 있으면 바로 설치합니다.", [updateNote, NSButton(title: "지금 확인", target: self, action: #selector(checkUpdate))]),
         ]
         var permRows = [NSView]()
         for (i, p) in Permission.all.enumerated() {
@@ -633,6 +636,7 @@ final class SettingsPage: NSObject {
     }
     func refreshPermissions() { for (i, p) in Permission.all.enumerated() { p.show(icon: permIcons[i], text: permLabels[i]) } }
     func stopRecording() { recorders.forEach { $0.stop() } }
+    @objc func checkUpdate() { onCheckUpdate?() }
     @objc func autoUpdateChanged() { AutoUpdate.enabled = autoUpdate.state == .on }
     func setLastEffective(_ summary: String) { lastEffective = summary; updateQualityNote() }
     func setConnected(_ connected: Bool) {

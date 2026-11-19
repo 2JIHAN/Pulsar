@@ -409,6 +409,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         settings = SettingsPage(allowAccess: allowAccess, preventSleep: preventSleep)
         updater.idle = { [weak self] in self.map { $0.host.active == nil && $0.outbound == nil && !$0.inSession } ?? false }
         updater.start()
+        settings.onCheckUpdate = { [weak self] in self?.updater.check { text in self?.settings.updateNote.stringValue = text } }
         sessionView = SessionView(viewer: viewer)
         sessionView.fullScreen.target = self; sessionView.fullScreen.action = #selector(toggleFullScreen)
         sessionView.leave.target = self; sessionView.leave.action = #selector(disconnectViewer)
