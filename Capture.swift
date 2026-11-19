@@ -337,13 +337,26 @@ func systemCursorScale() -> Double {
 @_silgen_name("CGCursorIsVisible") private func CGCursorIsVisibleGlobal() -> Int32
 
 // Standard AppKit cursors, matched by rendered image on the host and recreated natively on the viewer.
-let standardCursors: [String: NSCursor] = [
+let standardCursors: [String: NSCursor] = {
+    var all: [String: NSCursor] = [
     "arrow": .arrow, "iBeam": .iBeam, "pointingHand": .pointingHand, "openHand": .openHand, "closedHand": .closedHand,
     "crosshair": .crosshair, "resizeLeftRight": .resizeLeftRight, "resizeUpDown": .resizeUpDown, "resizeLeft": .resizeLeft,
     "resizeRight": .resizeRight, "resizeUp": .resizeUp, "resizeDown": .resizeDown, "operationNotAllowed": .operationNotAllowed,
     "dragCopy": .dragCopy, "dragLink": .dragLink, "contextualMenu": .contextualMenu, "disappearingItem": .disappearingItem,
     "iBeamVertical": .iBeamCursorForVerticalLayout,
 ]
+    // macOS 15 cursors: window-edge resize, column/row resize, zoom. Names carry the position and direction.
+    if #available(macOS 15.0, *) {
+        all["zoomIn"] = .zoomIn; all["zoomOut"] = .zoomOut
+        let positions: [(String, NSCursor.FrameResizePosition)] = [("Top", .top), ("Left", .left), ("Bottom", .bottom), ("Right", .right),
+            ("TopLeft", .topLeft), ("TopRight", .topRight), ("BottomLeft", .bottomLeft), ("BottomRight", .bottomRight)]
+        let directions: [(String, NSCursor.FrameResizeDirection.Set)] = [("All", .all), ("Inward", .inward), ("Outward", .outward)]
+        for (p, position) in positions { for (d, direction) in directions { all["frame\(p)\(d)"] = NSCursor.frameResize(position: position, directions: direction) } }
+        all["columnAll"] = .columnResize; all["columnLeft"] = .columnResize(directions: .left); all["columnRight"] = .columnResize(directions: .right)
+        all["rowAll"] = .rowResize; all["rowUp"] = .rowResize(directions: .up); all["rowDown"] = .rowResize(directions: .down)
+    }
+    return all
+}()
 extension CursorUpdate.Image {
     // At most 2x and at most 256 px on the long side; a 1x viewer screen downsamples.
     // 4x so the viewer can show it at Parsec's size (2x the pointer-scaled image) without blurring.
