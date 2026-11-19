@@ -175,15 +175,12 @@ struct RemoteCursor {
     // nil until the host sent a shape; hidden on the host shows a blank cursor here.
     var shown: NSCursor? { current.map { visible ? $0 : Self.blank } }
     mutating func reset() { current = nil; visible = true; screenWidth = nil; currentImage = nil }
-    // Parsec (parsecd 150-105c, client cursor path at 0x18f9xx): an image cursor is drawn at the size it has in
-    // the video, i.e. host size x (drawn screen width / host screen width), and snapped to the image's own size
-    // or half of it when within ~1 pt so it stays sharp. Hotspot scales with it.
-    static func parsecScale(width: Double, viewWidth: Double?, hostWidth: Double?) -> Double {
-        guard let v = viewWidth, let h = hostWidth, v > 0, h > 0, width > 0 else { return 1 }
-        let target = width * min(4, max(0.25, v / h))
-        if abs(target - width) <= 1.5 { return 1 }
-        if abs(target - width / 2) <= 1.5 { return 0.5 }
-        return target / width
+    // Size of app-made (image) cursors here, set by the Settings slider. macOS already enlarges them by this
+    // Mac's Pointer Size, as it does every cursor; this is the user's extra factor on top.
+    static let scaleKey = "PulsarImageCursorScale"
+    static var userScale: Double {
+        let v = UserDefaults.standard.object(forKey: scaleKey) as? Double ?? 2
+        return v.isFinite ? min(4, max(0.5, v)) : 2
     }
     // False for an image that does not decode to its announced size: the connection is closed.
     mutating func apply(_ u: CursorUpdate) -> Bool {
@@ -427,6 +424,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         settings = SettingsPage(allowAccess: allowAccess, preventSleep: preventSleep)
         updater.idle = { [weak self] in self.map { $0.host.active == nil && $0.outbound == nil && !$0.inSession } ?? false }
         updater.start()
+        settings.onCursorScaleChanged = { [weak self] in self?.sizedCursor = nil; self?.refreshCursor() }
         settings.onCheckUpdate = { [weak self] in self?.updater.check { text in self?.settings.updateNote.stringValue = text } }
         sessionView = SessionView(viewer: viewer)
         sessionView.fullScreen.target = self; sessionView.fullScreen.action = #selector(toggleFullScreen)
@@ -743,8 +741,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard hostCursor, let c = remoteCursor.shown else { return }
         guard pointerOverRemote() else { NSCursor.arrow.set(); return }
         guard c !== RemoteCursor.blank, let (hash, image) = remoteCursor.currentImage else { c.set(); return }
-        let view = presentation == .screens ? remoteScreen(at: NSEvent.mouseLocation)?.viewer : viewer
-        let k = RemoteCursor.parsecScale(width: image.width, viewWidth: view.map { Double($0.contentRect.width) }, hostWidth: remoteCursor.screenWidth)
+        let k = (RemoteCursor.userScale * 20).rounded() / 20
         if sizedCursor?.hash != hash || sizedCursor?.k != k { sizedCursor = (hash, k, k == 1 ? c : image.cursor(scale: k) ?? c) }
         sizedCursor?.cursor.set()
     }

@@ -60,9 +60,8 @@ func runSelfTests() {
         updaterTests()
         clickCountTests()
         scrollAndStandardCursorTests()
-        precondition(RemoteCursor.parsecScale(width: 28, viewWidth: 1512, hostWidth: 1512) == 1 && RemoteCursor.parsecScale(width: 28, viewWidth: 1512, hostWidth: 2900) == 0.5
-            && abs(RemoteCursor.parsecScale(width: 64, viewWidth: 1512, hostWidth: 2560) - 1512.0 / 2560) < 1e-9 && RemoteCursor.parsecScale(width: 28, viewWidth: nil, hostWidth: 2560) == 1, "FAIL parsec cursor scale")
-        print("PASS image cursor sized like the video (Parsec), snapped to 1x or 1/2 when within 1.5 pt")
+        precondition((0.5...4).contains(RemoteCursor.userScale), "FAIL image cursor scale range")
+        print("PASS image cursor size within 50-400% (default 200%)")
         try dockGestureTests()
         sessionTests(decoded)
         var pushes = 0, pops = [UnsafeMutableRawPointer]()
