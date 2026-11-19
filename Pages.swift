@@ -553,9 +553,6 @@ final class SettingsPage: NSObject {
     let preventSleep: NSSwitch
     let loginItem = NSSwitch()
     let autoUpdate = NSSwitch()
-    let cursorScale = NSSlider(value: RemoteCursor.userScale, minValue: 0.5, maxValue: 4, target: nil, action: nil)
-    let cursorScaleLabel = label("", 12, .regular, Palette.secondary)
-    var onCursorScaleChanged: (() -> Void)?
     let updateNote = label("", 11, .regular, Palette.secondary)
     var onCheckUpdate: (() -> Void)?
     let loginNote = label("", 11, .regular, Palette.secondary)
@@ -580,9 +577,6 @@ final class SettingsPage: NSObject {
         loginItem.target = self; loginItem.action = #selector(loginItemChanged)
         showLoginItem()
         autoUpdate.state = AutoUpdate.enabled ? .on : .off
-        cursorScale.isContinuous = true; cursorScale.target = self; cursorScale.action = #selector(cursorScaleChanged)
-        cursorScale.widthAnchor.constraint(equalToConstant: 180).isActive = true
-        showCursorScale()
         autoUpdate.target = self; autoUpdate.action = #selector(autoUpdateChanged)
         let general = [
             settingRow("이 Mac 원격 접속 허용", "켜 두면 Pulsar가 실행 중일 때 항상 접속을 기다립니다. 같은 Tailscale 계정의 Mac은 화면과 마우스·키보드를 모두 쓸 수 있습니다.", [allowAccess]),
@@ -627,7 +621,6 @@ final class SettingsPage: NSObject {
             settingRow("프레임", "60 fps는 화면이 부드럽지만 더 많은 대역폭을 사용합니다.", [fpsControl]),
             settingRow("화면이 하나일 때 가상 화면 사용", "이 Mac의 화면이 하나일 때 상대 Mac에 이 화면 크기의 가상 화면을 만들어 보여 줍니다. 끄면 상대 Mac의 기본 화면을 보여 줍니다.", [virtualDisplaySwitch]),
             settingRow("가장자리로 이 Mac에 돌아오기", "원격 화면의 왼쪽이나 오른쪽 바깥 끝으로 마우스를 0.25초 밀면 이 Mac으로 돌아오고, 다시 밀면 원격으로 들어갑니다.", [edgeReturnSwitch]),
-            settingRow("이미지 커서 크기", "돋보기, 캡처 십자선처럼 앱이 만든 커서의 크기입니다. 연결 중에도 바로 바뀝니다. 화살표 같은 기본 커서는 이 Mac의 포인터 크기를 따릅니다.", [cursorScaleLabel, cursorScale]),
         ]
         let info = Bundle.main.infoDictionary
         let version = label("Pulsar \(info?["CFBundleShortVersionString"] as? String ?? "") (\(info?["CFBundleVersion"] as? String ?? ""))", 11, .regular, Palette.secondary)
@@ -644,11 +637,7 @@ final class SettingsPage: NSObject {
     func refreshPermissions() { for (i, p) in Permission.all.enumerated() { p.show(icon: permIcons[i], text: permLabels[i]) } }
     func stopRecording() { recorders.forEach { $0.stop() } }
     @objc func checkUpdate() { onCheckUpdate?() }
-    @objc func cursorScaleChanged() {
-        UserDefaults.standard.set((cursorScale.doubleValue * 20).rounded() / 20, forKey: RemoteCursor.scaleKey)
-        showCursorScale(); onCursorScaleChanged?()
-    }
-    func showCursorScale() { cursorScaleLabel.stringValue = "\(Int((RemoteCursor.userScale * 100).rounded()))%" }
+
     @objc func autoUpdateChanged() { AutoUpdate.enabled = autoUpdate.state == .on }
     func setLastEffective(_ summary: String) { lastEffective = summary; updateQualityNote() }
     func setConnected(_ connected: Bool) {

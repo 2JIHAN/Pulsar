@@ -169,34 +169,17 @@ struct RemoteCursor {
     private(set) var current: NSCursor?
     private(set) var visible = true
     private(set) var screenWidth: Double?
-    // Image of the current app-made (non-standard) shape; refreshCursor sizes it to the view, like Parsec.
-    private(set) var images = [String: CursorUpdate.Image]()
-    private(set) var currentImage: (hash: String, image: CursorUpdate.Image)?
     // nil until the host sent a shape; hidden on the host shows a blank cursor here.
     var shown: NSCursor? { current.map { visible ? $0 : Self.blank } }
-    mutating func reset() { current = nil; visible = true; screenWidth = nil; currentImage = nil }
-    // Size of app-made (image) cursors here, set by the Settings slider. macOS already enlarges them by this
-    // Mac's Pointer Size, as it does every cursor; this is the user's extra factor on top.
-    static let scaleKey = "PulsarImageCursorScale"
-    // Largest factor that keeps the drawn cursor within 256 px on its long side. Past that the MacBook's
-    // cursor came out shrunk into the lower-left of its box (0.14.1, 0.15.0 at 200%); 216 px still drew fine.
-    static func cappedScale(_ k: Double, width: Double, height: Double, pointer: Double, backing: Double) -> Double {
-        let longest = max(width, height) * max(1, pointer) * max(1, backing)
-        return longest > 0 ? min(k, 256 / longest) : k
-    }
-    static var userScale: Double {
-        let v = UserDefaults.standard.object(forKey: scaleKey) as? Double ?? 1
-        return v.isFinite ? min(4, max(0.5, v)) : 1
-    }
+    mutating func reset() { current = nil; visible = true; screenWidth = nil }
     // False for an image that does not decode to its announced size: the connection is closed.
     mutating func apply(_ u: CursorUpdate) -> Bool {
         if let image = u.image, cache[u.hash] == nil {
             guard let c = image.cursor() else { return false }
-            if cache.count >= 32 { cache.removeAll(); images.removeAll() }
+            if cache.count >= 32 { cache.removeAll() }
             cache[u.hash] = c
-            if image.system == nil { images[u.hash] = image }
         }
-        if let c = cache[u.hash] { current = c; currentImage = images[u.hash].map { (u.hash, $0) } }
+        if let c = cache[u.hash] { current = c }
         visible = u.visible
         if let w = u.screenWidth { screenWidth = w }
         return true
@@ -430,7 +413,6 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         settings = SettingsPage(allowAccess: allowAccess, preventSleep: preventSleep)
         updater.idle = { [weak self] in self.map { $0.host.active == nil && $0.outbound == nil && !$0.inSession } ?? false }
         updater.start()
-        settings.onCursorScaleChanged = { [weak self] in self?.sizedCursor = nil; self?.refreshCursor() }
         settings.onCheckUpdate = { [weak self] in self?.updater.check { text in self?.settings.updateNote.stringValue = text } }
         sessionView = SessionView(viewer: viewer)
         sessionView.fullScreen.target = self; sessionView.fullScreen.action = #selector(toggleFullScreen)
@@ -745,14 +727,8 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // Only for a host that sends its cursor; others keep this Mac's arrow and the cursor in the video.
     func refreshCursor() {
         guard hostCursor, let c = remoteCursor.shown else { return }
-        guard pointerOverRemote() else { NSCursor.arrow.set(); return }
-        guard c !== RemoteCursor.blank, let (hash, image) = remoteCursor.currentImage else { c.set(); return }
-        let backing = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) })?.backingScaleFactor ?? 2
-        let k = (RemoteCursor.cappedScale(RemoteCursor.userScale, width: image.width, height: image.height, pointer: systemCursorScale(), backing: Double(backing)) * 20).rounded(.down) / 20
-        if sizedCursor?.hash != hash || sizedCursor?.k != k { sizedCursor = (hash, k, k == 1 ? c : image.cursor(scale: k) ?? c) }
-        sizedCursor?.cursor.set()
+        (pointerOverRemote() ? c : NSCursor.arrow).set()
     }
-    var sizedCursor: (hash: String, k: Double, cursor: NSCursor)?
     // While local, only the edge the pointer came back through leads into the remote screens again.
     func localEdge(_ e: NSEvent) {
         guard presentation == .local, inSession, let key = localPortal else { return }

@@ -60,10 +60,6 @@ func runSelfTests() {
         updaterTests()
         clickCountTests()
         scrollAndStandardCursorTests()
-        precondition((0.5...4).contains(RemoteCursor.userScale), "FAIL image cursor scale range")
-        precondition(RemoteCursor.cappedScale(2, width: 28, height: 26, pointer: 1.3, backing: 2) == 2
-            && abs(RemoteCursor.cappedScale(2, width: 64, height: 40, pointer: 1.3, backing: 2) - 256 / (64 * 1.3 * 2)) < 1e-9, "FAIL cursor size cap")
-        print("PASS image cursor size within 50-400% (default 100%), capped at 256 px drawn")
         // Regression: the cursor must fill its bitmap, not only the lower-left corner, on host and viewer.
         let fullCursor = NSCursor(image: NSImage(size: NSSize(width: 20, height: 10), flipped: false) { r in NSColor.red.setFill(); r.fill(); return true }, hotSpot: .zero)
         let sent = CursorUpdate.Image(cursor: fullCursor)!
