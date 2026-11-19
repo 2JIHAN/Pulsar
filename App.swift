@@ -635,9 +635,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func refreshMonitorMenus() {
         guard let map = screenMap else { for b in boards { b.setMonitors([], current: nil) }; return }
-        // With a single host monitor there is nothing to switch to; the virtual-screen choice for that case is
-        // the Settings switch "화면이 하나일 때 가상 화면 사용", so the menu stays hidden.
-        let choices = map.switchable.count > 1 ? map.switchable.map { (title: $0.name, wire: $0.id) } + [(title: "가상 화면", wire: ScreenSource.virtualWire)] : []
+        // Agreed screen rules: host monitors pair with this Mac's screens, extra screens here get virtual displays
+        // automatically, and only host monitors left over (more there than screens here) are offered to switch to.
+        let choices = map.switchable.count > clientScreens.count ? map.switchable.map { (title: $0.name, wire: $0.id) } : []
         func current(_ id: Int) -> String? { map.screens.first { $0.clientScreenId == id }?.hostDisplayId }
         for rs in remoteScreens { rs.view.setMonitors(choices, current: current(rs.id)) }
         sessionView.setMonitors(choices, current: current(0))
