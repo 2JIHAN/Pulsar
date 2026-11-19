@@ -61,7 +61,9 @@ func runSelfTests() {
         clickCountTests()
         scrollAndStandardCursorTests()
         precondition((0.5...4).contains(RemoteCursor.userScale), "FAIL image cursor scale range")
-        print("PASS image cursor size within 50-400% (default 200%)")
+        precondition(RemoteCursor.cappedScale(2, width: 28, height: 26, pointer: 1.3, backing: 2) == 2
+            && abs(RemoteCursor.cappedScale(2, width: 64, height: 40, pointer: 1.3, backing: 2) - 256 / (64 * 1.3 * 2)) < 1e-9, "FAIL cursor size cap")
+        print("PASS image cursor size within 50-400% (default 200%), capped at 256 px drawn")
         try dockGestureTests()
         sessionTests(decoded)
         var pushes = 0, pops = [UnsafeMutableRawPointer]()

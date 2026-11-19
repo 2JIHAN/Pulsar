@@ -178,6 +178,12 @@ struct RemoteCursor {
     // Size of app-made (image) cursors here, set by the Settings slider. macOS already enlarges them by this
     // Mac's Pointer Size, as it does every cursor; this is the user's extra factor on top.
     static let scaleKey = "PulsarImageCursorScale"
+    // Largest factor that keeps the drawn cursor within 256 px on its long side. Past that the MacBook's
+    // cursor came out shrunk into the lower-left of its box (0.14.1, 0.15.0 at 200%); 216 px still drew fine.
+    static func cappedScale(_ k: Double, width: Double, height: Double, pointer: Double, backing: Double) -> Double {
+        let longest = max(width, height) * max(1, pointer) * max(1, backing)
+        return longest > 0 ? min(k, 256 / longest) : k
+    }
     static var userScale: Double {
         let v = UserDefaults.standard.object(forKey: scaleKey) as? Double ?? 2
         return v.isFinite ? min(4, max(0.5, v)) : 2
@@ -741,7 +747,8 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard hostCursor, let c = remoteCursor.shown else { return }
         guard pointerOverRemote() else { NSCursor.arrow.set(); return }
         guard c !== RemoteCursor.blank, let (hash, image) = remoteCursor.currentImage else { c.set(); return }
-        let k = (RemoteCursor.userScale * 20).rounded() / 20
+        let backing = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) })?.backingScaleFactor ?? 2
+        let k = (RemoteCursor.cappedScale(RemoteCursor.userScale, width: image.width, height: image.height, pointer: systemCursorScale(), backing: Double(backing)) * 20).rounded(.down) / 20
         if sizedCursor?.hash != hash || sizedCursor?.k != k { sizedCursor = (hash, k, k == 1 ? c : image.cursor(scale: k) ?? c) }
         sizedCursor?.cursor.set()
     }
