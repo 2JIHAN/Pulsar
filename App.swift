@@ -175,8 +175,9 @@ struct RemoteCursor {
     // False for an image that does not decode to its announced size: the connection is closed.
     mutating func apply(_ u: CursorUpdate) -> Bool {
         if let image = u.image, cache[u.hash] == nil {
-            // macOS enlarges only system cursors by Pointer Size, so apply the larger of the two Macs' settings here.
-            guard let c = image.cursor(scale: max(systemCursorScale(), image.pointerScale ?? 1)) else { return false }
+            // App-made cursors: Parsec shows the host's largest image (2x of the Pointer Size image) at its pixel
+            // size in points; at Pointer Size alone they looked under half that size here, so match Parsec.
+            guard let c = image.cursor(scale: 2 * max(systemCursorScale(), image.pointerScale ?? 1)) else { return false }
             if cache.count >= 32 { cache.removeAll() }
             cache[u.hash] = c
         }

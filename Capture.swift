@@ -346,7 +346,8 @@ let standardCursors: [String: NSCursor] = [
 ]
 extension CursorUpdate.Image {
     // At most 2x and at most 256 px on the long side; a 1x viewer screen downsamples.
-    static func renderScale(width: Double, height: Double) -> Double { min(2, Double(CursorUpdate.maxPixels) / max(1, width, height)) }
+    // 4x so the viewer can show it at Parsec's size (2x the pointer-scaled image) without blurring.
+    static func renderScale(width: Double, height: Double) -> Double { min(4, Double(CursorUpdate.maxPixels) / max(1, width, height)) }
     // NSCursor.currentSystem is the cursor any app has set (measured with another process setting
     // I-beam and resize cursors). Its image has 1x to 10x representations, so it is redrawn at a bounded size.
     // `pointScale` is the host's Accessibility pointer size: WindowServer enlarges the host cursor by it,

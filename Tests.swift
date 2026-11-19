@@ -622,6 +622,8 @@ func hostingTests() {
 }
 
 func virtualDisplayTests() {
+    // A live Pulsar session already holds a virtual display; creating another then fails, so skip rather than fail.
+    if NSScreen.screens.contains(where: { $0.localizedName == "Pulsar" }) { print("SKIP virtual display: a Pulsar session's virtual display is online"); return }
     func require(_ condition: @autoclosure () -> Bool, _ message: String = "condition failed", line: UInt = #line) {
         if !condition() { fputs("FAIL virtual display line \(line): \(message)\n", stderr); exit(1) }
     }
@@ -1027,10 +1029,10 @@ func cursorTests() throws {
     let legacyEff = EffectiveQuality.decodeWire(Data([6]) + Data(#"{"codec":"h264","chroma":"420","bitrateMbps":8,"maxResolution":"1080p","fps":30,"timing":true}"#.utf8))
     require(legacyEff?.cursor == false && legacyEff?.dockGesture == false && legacyEff?.timing == true, "0.10 host EffectiveQuality decodes without cursor/dockGesture")
 
-    require(CursorUpdate.Image.renderScale(width: 28, height: 40) == 2 && CursorUpdate.Image.renderScale(width: 200, height: 100) == 1.28, "render scale: 2x, capped at 256 px")
+    require(CursorUpdate.Image.renderScale(width: 28, height: 40) == 4 && CursorUpdate.Image.renderScale(width: 200, height: 100) == 1.28, "render scale: 4x, capped at 256 px")
     let ibeam = try require2(CursorUpdate.Image(cursor: NSCursor.iBeam), "I-beam renders")
     let size = NSCursor.iBeam.image.size
-    require(ibeam.width == size.width && ibeam.pixelWidth == Int((size.width * 2).rounded()) && ibeam.hotX == NSCursor.iBeam.hotSpot.x && ibeam.png.count <= CursorUpdate.maxPNGBytes, "I-beam image \(ibeam.pixelWidth)x\(ibeam.pixelHeight) px")
+    require(ibeam.width == size.width && ibeam.pixelWidth == Int((size.width * 4).rounded()) && ibeam.hotX == NSCursor.iBeam.hotSpot.x && ibeam.png.count <= CursorUpdate.maxPNGBytes, "I-beam image \(ibeam.pixelWidth)x\(ibeam.pixelHeight) px")
     let big = NSCursor(image: NSImage(size: NSSize(width: 200, height: 100), flipped: false) { r in NSColor.red.setFill(); r.fill(); return true }, hotSpot: NSPoint(x: 199, y: 50))
     let bigImage = try require2(CursorUpdate.Image(cursor: big), "large cursor renders")
     require(bigImage.pixelWidth == 256 && bigImage.pixelHeight == 128 && bigImage.width == 200 && bigImage.hotX == 199, "large cursor capped to 256x128 px at 200x100 pt")
@@ -1038,7 +1040,7 @@ func cursorTests() throws {
     require(scaled.width == size.width * 1.5 && scaled.height == size.height * 1.5 && scaled.hotX == NSCursor.iBeam.hotSpot.x * 1.5 && scaled.hotY == NSCursor.iBeam.hotSpot.y * 1.5, "host pointer size enlarges image and hotspot")
     let made = try require2(ibeam.cursor(), "viewer builds NSCursor")
     let rep = made.image.representations.first
-    require(made.image.size == size && made.hotSpot == NSCursor.iBeam.hotSpot && rep?.pixelsWide == ibeam.pixelWidth && rep?.size == size, "viewer cursor keeps host points (\(size)) with 2x pixels and hotspot")
+    require(made.image.size == size && made.hotSpot == NSCursor.iBeam.hotSpot && rep?.pixelsWide == Int((size.width * 2).rounded()) && rep?.size == size, "viewer cursor keeps host points (\(size)) with 2x pixels and hotspot")
 
     let hash = fnv1a64(ibeam.png)
     let first = try require2(CursorUpdate.next(hash: hash, image: ibeam, visible: true, sentHash: nil, sentVisible: nil), "first shape sent")
