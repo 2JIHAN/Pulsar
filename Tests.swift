@@ -1071,6 +1071,11 @@ func cursorTests() throws {
     require(remote.apply(CursorUpdate(visible: true, hash: hash, screenWidth: 1512)) && remote.screenWidth == 1512, "host display width kept")
     require(CursorUpdate.next(hash: hash, image: ibeam, visible: true, sentHash: hash, sentVisible: true, width: 1512, sentWidth: 2560) == CursorUpdate(visible: true, hash: hash, screenWidth: 1512), "display change resends width without image")
     require(CursorUpdate.decodeWire(CursorUpdate(visible: true, hash: hash, screenWidth: .infinity).wireMessage()) == nil && CursorUpdate.decodeWire(CursorUpdate(visible: true, hash: hash, screenWidth: 10).wireMessage()) == nil, "bad host width rejected")
+    let enlarged = try require2(ibeam.cursor(scale: 1.5), "scaled viewer cursor")
+    require(enlarged.image.size.width == ibeam.width * 1.5 && enlarged.hotSpot.x == ibeam.hotX * 1.5 && enlarged.hotSpot.y == ibeam.hotY * 1.5, "Pointer Size scales image and hotspot together")
+    var withScale = ibeam; withScale.pointerScale = 1.3
+    require(CursorUpdate.decodeWire(CursorUpdate(visible: true, hash: hash, image: withScale).wireMessage())?.image?.pointerScale == 1.3, "host pointer scale roundtrip")
+    withScale.pointerScale = 20; require(!withScale.valid, "absurd pointer scale rejected")
     remote.reset(); require(remote.shown == nil && remote.cache.count == 1 && remote.screenWidth == nil, "reset on reconnect keeps the cache")
     print("PASS cursor: showsCursor off only for cursor-capable viewers, CursorUpdate roundtrip (\(wire.count) bytes) and \(bad.count + 1) malformed updates rejected, shape/visibility dedupe, 2x render capped at 256 px, viewer keeps host point size/hotspot, hidden -> blank, cache by hash")
 

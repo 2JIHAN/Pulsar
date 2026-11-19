@@ -728,12 +728,16 @@ struct CursorUpdate: Codable, Equatable {
         // Points, hotspot from the top-left. The viewer draws it at this point size, so it looks the same size as on the host.
         var width: Double, height: Double
         var hotX: Double, hotY: Double
+        // 0.13.2+: the host's Pointer Size (WindowServer cursor scale). macOS applies that setting only to
+        // system cursors, not to an app's own NSCursor, so the viewer applies it itself.
+        var pointerScale: Double? = nil
         var valid: Bool {
             func ratio(_ px: Int, _ pt: Double) -> Bool { (0.5...4).contains(Double(px) / pt) }
             return (1...CursorUpdate.maxPixels).contains(pixelWidth) && (1...CursorUpdate.maxPixels).contains(pixelHeight)
                 && (8...CursorUpdate.maxPNGBytes).contains(png.count) && png.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
                 && [width, height, hotX, hotY].allSatisfy(\.isFinite) && width >= 1 && height >= 1 && ratio(pixelWidth, width) && ratio(pixelHeight, height)
                 && (0...width).contains(hotX) && (0...height).contains(hotY)
+                && (pointerScale.map { $0.isFinite && (0.5...8).contains($0) } ?? true)
         }
     }
     var visible: Bool

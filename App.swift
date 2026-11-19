@@ -173,7 +173,8 @@ struct RemoteCursor {
     // False for an image that does not decode to its announced size: the connection is closed.
     mutating func apply(_ u: CursorUpdate) -> Bool {
         if let image = u.image, cache[u.hash] == nil {
-            guard let c = image.cursor() else { return false }
+            // macOS enlarges only system cursors by Pointer Size, so apply the larger of the two Macs' settings here.
+            guard let c = image.cursor(scale: max(systemCursorScale(), image.pointerScale ?? 1)) else { return false }
             if cache.count >= 32 { cache.removeAll() }
             cache[u.hash] = c
         }

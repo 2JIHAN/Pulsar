@@ -325,6 +325,13 @@ final class Capture: NSObject, SCStreamOutput, SCStreamDelegate {
 func capturesCursor(_ request: QualityRequest?) -> Bool { request?.cursor != true }
 
 @_silgen_name("CGSCurrentCursorSeed") private func CGSCurrentCursorSeed() -> Int32
+@_silgen_name("CGSMainConnectionID") private func CGSMainConnectionID() -> Int32
+@_silgen_name("CGSGetCursorScale") private func CGSGetCursorScale(_ cid: Int32, _ scale: UnsafeMutablePointer<Float>) -> Int32
+// The Pointer Size setting as WindowServer applies it to system cursors (1 when unreadable).
+func systemCursorScale() -> Double {
+    var s: Float = 1
+    return CGSGetCursorScale(CGSMainConnectionID(), &s) == 0 && s.isFinite && s >= 1 ? Double(s) : 1
+}
 // Deprecated and unavailable to Swift, but on macOS 27.2.1 it still reads the window server's global
 // state: measured 0 while another process hid the cursor or it was hidden until the mouse moves, 1 otherwise.
 @_silgen_name("CGCursorIsVisible") private func CGCursorIsVisibleGlobal() -> Int32
@@ -354,11 +361,12 @@ extension CursorUpdate.Image {
         guard valid else { return nil }
     }
     // Viewer side. nil when the PNG does not decode to the announced pixel size.
-    func cursor() -> NSCursor? {
+    // `scale` enlarges image and hotspot together, so the arrow tip stays on the click point.
+    func cursor(scale: Double = 1) -> NSCursor? {
         guard valid, let rep = NSBitmapImageRep(data: png), rep.pixelsWide == pixelWidth, rep.pixelsHigh == pixelHeight else { return nil }
-        rep.size = NSSize(width: width, height: height)
+        rep.size = NSSize(width: width * scale, height: height * scale)
         let image = NSImage(size: rep.size); image.addRepresentation(rep)
-        return NSCursor(image: image, hotSpot: NSPoint(x: hotX, y: hotY))
+        return NSCursor(image: image, hotSpot: NSPoint(x: hotX * scale, y: hotY * scale))
     }
 }
 // Host: polls the system cursor at 60 Hz while a 0.11 viewer is connected. The seed changes with the
@@ -379,7 +387,8 @@ final class CursorTracker {
     func stop() { timer?.invalidate(); timer = nil; seed = nil; shape = nil; sentHash = nil; sentVisible = nil; sentWidth = nil }
     private func tick() {
         let s = CGSCurrentCursorSeed()
-        if s != seed, let c = NSCursor.currentSystem, let image = CursorUpdate.Image(cursor: c) {
+        if s != seed, let c = NSCursor.currentSystem, var image = CursorUpdate.Image(cursor: c) {
+            image.pointerScale = systemCursorScale()
             seed = s; shape = (fnv1a64(image.png), image)
         }
         guard let shape, let u = CursorUpdate.next(hash: shape.hash, image: shape.image, visible: CGCursorIsVisibleGlobal() != 0, sentHash: sentHash, sentVisible: sentVisible) else { return }
