@@ -57,6 +57,7 @@ func runSelfTests() {
         print("PASS empty release no-op, held key/button/modifier cleanup with nonposting event sink")
         try gestureTests(injector: injector)
         try cursorTests()
+        updaterTests()
         try dockGestureTests()
         sessionTests(decoded)
         var pushes = 0, pops = [UnsafeMutableRawPointer]()
@@ -1031,6 +1032,8 @@ func cursorTests() throws {
     let big = NSCursor(image: NSImage(size: NSSize(width: 200, height: 100), flipped: false) { r in NSColor.red.setFill(); r.fill(); return true }, hotSpot: NSPoint(x: 199, y: 50))
     let bigImage = try require2(CursorUpdate.Image(cursor: big), "large cursor renders")
     require(bigImage.pixelWidth == 256 && bigImage.pixelHeight == 128 && bigImage.width == 200 && bigImage.hotX == 199, "large cursor capped to 256x128 px at 200x100 pt")
+    let scaled = try require2(CursorUpdate.Image(cursor: NSCursor.iBeam, pointScale: 1.5), "scaled I-beam renders")
+    require(scaled.width == size.width * 1.5 && scaled.height == size.height * 1.5 && scaled.hotX == NSCursor.iBeam.hotSpot.x * 1.5 && scaled.hotY == NSCursor.iBeam.hotSpot.y * 1.5, "host pointer size enlarges image and hotspot")
     let made = try require2(ibeam.cursor(), "viewer builds NSCursor")
     let rep = made.image.representations.first
     require(made.image.size == size && made.hotSpot == NSCursor.iBeam.hotSpot && rep?.pixelsWide == ibeam.pixelWidth && rep?.size == size, "viewer cursor keeps host points (\(size)) with 2x pixels and hotspot")
@@ -1157,4 +1160,18 @@ func dockGestureTests() throws {
     require(tap.handle(dockType, unknown) && sent.count == 5, "other DockSwipe motions (pinch) swallowed while remote, not sent")
     tap.set(false)
     print("PASS dock gesture tap: installed only on request and once, removed idempotently, swallows DockSwipe only while installed, forwards began/changed/ended, cancel on removal mid-swipe, timeout re-enable, own replays and other events pass")
+}
+
+func updaterTests() {
+    func require(_ condition: @autoclosure () -> Bool, _ message: String, line: UInt = #line) {
+        precondition(condition(), "FAIL updater line \(line): \(message)"); print("PASS \(message)")
+    }
+    func r(_ tag: String, draft: Bool = false, asset: String? = nil) -> AutoUpdate.Release {
+        let v = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+        return AutoUpdate.Release(tag_name: tag, draft: draft, assets: [.init(name: asset ?? "Pulsar-\(v)-macOS-arm64.zip", browser_download_url: URL(string: "https://example.com/\(v).zip")!)])
+    }
+    require(AutoUpdate.isNewer("0.12.0", than: "0.11.1") && AutoUpdate.isNewer("0.10.0", than: "0.9.0") && !AutoUpdate.isNewer("0.11.1", than: "0.11.1"), "numeric version order (0.10 > 0.9)")
+    require(AutoUpdate.newest([r("v0.11.0"), r("v0.13.0", draft: true), r("v0.12.0"), r("v0.10.0")], current: "0.11.1")?.version == "0.12.0", "newest non-draft newer release chosen")
+    require(AutoUpdate.newest([r("v0.12.0", asset: "Other.zip"), r("v0.11.1")], current: "0.11.1") == nil, "no update without the app zip or when current")
+    require(AutoUpdate.prepare(zip: URL(fileURLWithPath: "/nonexistent.zip"), version: "0.12.0") == nil, "unreadable download refused")
 }

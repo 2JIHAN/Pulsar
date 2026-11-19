@@ -334,8 +334,11 @@ extension CursorUpdate.Image {
     static func renderScale(width: Double, height: Double) -> Double { min(2, Double(CursorUpdate.maxPixels) / max(1, width, height)) }
     // NSCursor.currentSystem is the cursor any app has set (measured with another process setting
     // I-beam and resize cursors). Its image has 1x to 10x representations, so it is redrawn at a bounded size.
-    init?(cursor: NSCursor) {
-        let size = cursor.image.size
+    // `pointScale` is the host's Accessibility pointer size: WindowServer enlarges the host cursor by it,
+    // but NSCursor.currentSystem reports the unscaled image, so the viewer would otherwise draw it smaller.
+    init?(cursor: NSCursor, pointScale: Double = 1) {
+        let k = min(4, max(1, pointScale))
+        let size = NSSize(width: cursor.image.size.width * k, height: cursor.image.size.height * k)
         guard size.width >= 1, size.height >= 1 else { return nil }
         let scale = Self.renderScale(width: size.width, height: size.height)
         let pw = max(1, Int((size.width * scale).rounded())), ph = max(1, Int((size.height * scale).rounded()))
@@ -347,7 +350,7 @@ extension CursorUpdate.Image {
         cursor.image.draw(in: NSRect(origin: .zero, size: size))
         NSGraphicsContext.restoreGraphicsState()
         guard let png = rep.representation(using: .png, properties: [:]) else { return nil }
-        self.init(png: png, pixelWidth: pw, pixelHeight: ph, width: size.width, height: size.height, hotX: cursor.hotSpot.x, hotY: cursor.hotSpot.y)
+        self.init(png: png, pixelWidth: pw, pixelHeight: ph, width: size.width, height: size.height, hotX: cursor.hotSpot.x * k, hotY: cursor.hotSpot.y * k)
         guard valid else { return nil }
     }
     // Viewer side. nil when the PNG does not decode to the announced pixel size.
@@ -372,9 +375,14 @@ final class CursorTracker {
         timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { [weak self] _ in self?.tick() }
     }
     func stop() { timer?.invalidate(); timer = nil; seed = nil; shape = nil; sentHash = nil; sentVisible = nil }
+    // Read on each shape change, so a new size applies from the next shape change.
+    static func hostPointerSize() -> Double {
+        CFPreferencesAppSynchronize("com.apple.universalaccess" as CFString)
+        return (CFPreferencesCopyAppValue("mouseDriverCursorSize" as CFString, "com.apple.universalaccess" as CFString) as? NSNumber)?.doubleValue ?? 1
+    }
     private func tick() {
         let s = CGSCurrentCursorSeed()
-        if s != seed, let c = NSCursor.currentSystem, let image = CursorUpdate.Image(cursor: c) {
+        if s != seed, let c = NSCursor.currentSystem, let image = CursorUpdate.Image(cursor: c, pointScale: Self.hostPointerSize()) {
             seed = s; shape = (fnv1a64(image.png), image)
         }
         guard let shape, let u = CursorUpdate.next(hash: shape.hash, image: shape.image, visible: CGCursorIsVisibleGlobal() != 0, sentHash: sentHash, sentVisible: sentVisible) else { return }

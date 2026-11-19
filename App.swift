@@ -242,6 +242,7 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let preventSleep = NSSwitch()
     let guestInput = NSSwitch()
     let sleepAssertion = SleepAssertion()
+    let updater = Updater()
     var streams = [HostStream]()
     var streamRequest: QualityRequest?
     let viewer = Viewer()
@@ -406,6 +407,8 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.session.start(DialTarget(tailnet: ip)); self.statusText = "\(d.name)에 연결하는 중…"; self.dial()
         }
         settings = SettingsPage(allowAccess: allowAccess, preventSleep: preventSleep)
+        updater.idle = { [weak self] in self.map { $0.host.active == nil && $0.outbound == nil && !$0.inSession } ?? false }
+        updater.start()
         sessionView = SessionView(viewer: viewer)
         sessionView.fullScreen.target = self; sessionView.fullScreen.action = #selector(toggleFullScreen)
         sessionView.leave.target = self; sessionView.leave.action = #selector(disconnectViewer)

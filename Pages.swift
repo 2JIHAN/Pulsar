@@ -552,6 +552,7 @@ final class SettingsPage: NSObject {
     let allowAccess: NSSwitch
     let preventSleep: NSSwitch
     let loginItem = NSSwitch()
+    let autoUpdate = NSSwitch()
     let loginNote = label("", 11, .regular, Palette.secondary)
     let keyNote = label("", 11, .regular, Palette.secondary)
     let codecPopup = NSPopUpButton()
@@ -573,10 +574,13 @@ final class SettingsPage: NSObject {
         super.init()
         loginItem.target = self; loginItem.action = #selector(loginItemChanged)
         showLoginItem()
+        autoUpdate.state = AutoUpdate.enabled ? .on : .off
+        autoUpdate.target = self; autoUpdate.action = #selector(autoUpdateChanged)
         let general = [
             settingRow("이 Mac 원격 접속 허용", "켜 두면 Pulsar가 실행 중일 때 항상 접속을 기다립니다. 같은 Tailscale 계정의 Mac은 화면과 마우스·키보드를 모두 쓸 수 있습니다.", [allowAccess]),
             settingRow("잠자기 방지", "원격 접속을 기다리는 동안 Mac이 잠들지 않도록 유지합니다.", [preventSleep]),
             settingRow("로그인 시 Pulsar 실행", nil, [loginNote, loginItem]),
+            settingRow("자동 업데이트", "새 버전이 나오면 원격 연결이 없을 때 내려받아 설치하고 Pulsar를 다시 엽니다.", [autoUpdate]),
         ]
         var permRows = [NSView]()
         for (i, p) in Permission.all.enumerated() {
@@ -629,6 +633,7 @@ final class SettingsPage: NSObject {
     }
     func refreshPermissions() { for (i, p) in Permission.all.enumerated() { p.show(icon: permIcons[i], text: permLabels[i]) } }
     func stopRecording() { recorders.forEach { $0.stop() } }
+    @objc func autoUpdateChanged() { AutoUpdate.enabled = autoUpdate.state == .on }
     func setLastEffective(_ summary: String) { lastEffective = summary; updateQualityNote() }
     func setConnected(_ connected: Bool) {
         isConnected = connected
