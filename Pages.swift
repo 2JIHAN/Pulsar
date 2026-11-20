@@ -565,6 +565,7 @@ final class SettingsPage: NSObject {
     let priorityControl = NSSegmentedControl(labels: StreamPriority.allCases.map(\.label), trackingMode: .selectOne, target: nil, action: nil)
     let virtualDisplaySwitch = NSSwitch()
     let edgeReturnSwitch = NSSwitch()
+    let remoteSideControl = NSSegmentedControl(labels: ["왼쪽", "오른쪽"], trackingMode: .selectOne, target: nil, action: nil)
     let adaptiveSwitch = NSSwitch()
     let qualityNote = label("최근 연결: 없음", 11, .regular, Palette.secondary)
     private var lastEffective: String?
@@ -610,7 +611,7 @@ final class SettingsPage: NSObject {
         bitratePopup.addItems(withTitles: ["자동 (8 Mbps)", "5 Mbps", "10 Mbps", "20 Mbps", "35 Mbps", "50 Mbps"])
         resolutionPopup.addItems(withTitles: ["1080p (1920×1080)", "1440p (2560×1440)", "원본 (최대 3840×2400)"])
         for c in [codecPopup, bitratePopup, adaptiveSwitch, resolutionPopup, virtualDisplaySwitch, edgeReturnSwitch] as [NSControl] { c.target = self; c.action = #selector(qualityChanged) }
-        for c in [chromaControl, fpsControl, priorityControl] as [NSSegmentedControl] { c.target = self; c.action = #selector(qualityChanged) }
+        for c in [chromaControl, fpsControl, priorityControl, remoteSideControl] as [NSSegmentedControl] { c.target = self; c.action = #selector(qualityChanged) }
         syncQualityControls()
         qualityNote.lineBreakMode = .byWordWrapping; qualityNote.maximumNumberOfLines = 0
         let qualityRows = [
@@ -622,7 +623,8 @@ final class SettingsPage: NSObject {
             settingRow("최대 해상도", "호스트 기본 해상도를 짝수 크기와 비율을 유지해 축소합니다.", [resolutionPopup]),
             settingRow("프레임", "60 fps는 화면이 부드럽지만 더 많은 대역폭을 사용합니다.", [fpsControl]),
             settingRow("화면이 하나일 때 가상 화면 사용", "이 Mac의 화면이 하나일 때 상대 Mac에 이 화면 크기의 가상 화면을 만들어 보여 줍니다. 끄면 상대 Mac의 기본 화면을 보여 줍니다.", [virtualDisplaySwitch]),
-            settingRow("가장자리로 이 Mac에 돌아오기", "원격 화면의 왼쪽이나 오른쪽 바깥 끝으로 마우스를 0.25초 밀면 이 Mac으로 돌아오고, 다시 밀면 원격으로 들어갑니다.", [edgeReturnSwitch]),
+            settingRow("가장자리로 이 Mac에 돌아오기", "맞닿은 끝을 0.25초 밀면 이 Mac으로 돌아옵니다. 안쪽으로 물러났다가 다시 밀면 원격으로 바로 들어갑니다.", [edgeReturnSwitch]),
+            settingRow("원격 화면 위치", "이 Mac을 기준으로 원격 화면이 이어질 방향입니다. 실제 모니터 배치는 바뀌지 않습니다.", [remoteSideControl]),
         ]
         let info = Bundle.main.infoDictionary
         let version = label("Pulsar \(info?["CFBundleShortVersionString"] as? String ?? "") (\(info?["CFBundleVersion"] as? String ?? ""))", 11, .regular, Palette.secondary)
@@ -659,6 +661,7 @@ final class SettingsPage: NSObject {
         fpsControl.selectedSegment = FPSOption.allCases.firstIndex(of: prefs.fps) ?? 0
         priorityControl.selectedSegment = StreamPriority.allCases.firstIndex(of: prefs.priority) ?? 0
         virtualDisplaySwitch.state = prefs.singleScreenVirtual ? .on : .off
+        remoteSideControl.selectedSegment = prefs.remoteSide == .left ? 0 : 1
         edgeReturnSwitch.state = prefs.edgeReturn ? .on : .off
         adaptiveSwitch.state = prefs.adaptiveBitrate ? .on : .off
         updateChromaState(savedChroma: prefs.chroma)
@@ -677,6 +680,7 @@ final class SettingsPage: NSObject {
         prefs.fps = FPSOption.allCases[max(0, fpsControl.selectedSegment)]
         prefs.priority = StreamPriority.allCases[max(0, priorityControl.selectedSegment)]
         prefs.singleScreenVirtual = virtualDisplaySwitch.state == .on
+        prefs.remoteSide = remoteSideControl.selectedSegment == 0 ? .left : .right
         prefs.edgeReturn = edgeReturnSwitch.state == .on
         prefs.adaptiveBitrate = adaptiveSwitch.state == .on
         if sender === chromaControl {

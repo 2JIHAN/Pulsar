@@ -512,6 +512,7 @@ struct StreamQualityPreferences: Equatable {
     var fps: FPSOption = .fps30
     var singleScreenVirtual: Bool = false
     var edgeReturn: Bool = true
+    var remoteSide: EdgeSide = .right
     var adaptiveBitrate: Bool = true
     var priority: StreamPriority = .speed
 
@@ -534,6 +535,7 @@ struct StreamQualityPreferences: Equatable {
         if let raw = d.string(forKey: resolutionKey), let v = MaxResolutionOption(rawValue: raw) { p.maxResolution = v }
         if d.object(forKey: fpsKey) != nil, let v = FPSOption(rawValue: d.integer(forKey: fpsKey)) { p.fps = v }
         if d.object(forKey: virtualDisplayKey) != nil { p.singleScreenVirtual = d.bool(forKey: virtualDisplayKey) }
+        p.remoteSide = EdgeSide(rawValue: d.string(forKey: "session.remoteSide") ?? "") ?? .right
         if d.object(forKey: edgeReturnKey) != nil { p.edgeReturn = d.bool(forKey: edgeReturnKey) }
         if d.object(forKey: adaptiveKey) != nil { p.adaptiveBitrate = d.bool(forKey: adaptiveKey) }
         if let raw = d.string(forKey: priorityKey), let v = StreamPriority(rawValue: raw) { p.priority = v }
@@ -546,6 +548,7 @@ struct StreamQualityPreferences: Equatable {
         d.set(maxResolution.rawValue, forKey: Self.resolutionKey)
         d.set(fps.rawValue, forKey: Self.fpsKey)
         d.set(singleScreenVirtual, forKey: Self.virtualDisplayKey)
+        d.set(remoteSide.rawValue, forKey: "session.remoteSide")
         d.set(edgeReturn, forKey: Self.edgeReturnKey)
         d.set(adaptiveBitrate, forKey: Self.adaptiveKey)
         d.set(priority.rawValue, forKey: Self.priorityKey)

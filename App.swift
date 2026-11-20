@@ -259,8 +259,14 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var layoutChosen = false
     var legacyHost = false
     var edgeReturn = true
+    var remoteSide: EdgeSide = .right
     var edgePressure: EdgePressure?
     var localPortal: EdgePressure.Key?
+    var reentry = PortalReentry()
+    var heldEdgeKeys = Set<UInt16>()
+    func blocksEdge(_ e: NSEvent) -> Bool {
+        !heldEdgeKeys.isEmpty || NSEvent.pressedMouseButtons != 0 || !e.modifierFlags.intersection([.shift, .control, .option, .command, .function]).isEmpty
+    }
     let edgeOverlay = EdgeSurfaceOverlay()
     var statusItem: NSStatusItem?
     var boardPressed = false
@@ -337,6 +343,11 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // Session shortcuts are matched first and stay on this Mac, along with their keyUp.
         NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] e in
             guard let self, self.isSessionWindow(e.window) else { return e }
+            if self.presentation == .screens {
+                self.advanceEdge(nil, point: .zero, now: e.timestamp)
+                if e.type == .keyDown { self.heldEdgeKeys.insert(e.keyCode) }
+                if e.type == .keyUp { self.heldEdgeKeys.remove(e.keyCode) }
+            }
             if self.inSession, let action = ShortcutAction.matching(e) { self.consumedKey = e.keyCode; self.perform(action); return nil }
             if e.type == .keyUp, self.consumedKey == e.keyCode { self.consumedKey = nil; return nil }
             guard self.forwardingKeys else { return e }
@@ -483,7 +494,10 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func remoteScreen(at p: NSPoint) -> RemoteScreen? { remoteScreens.first { NSMouseInRect(p, $0.window.frame, false) } }
     func isSessionWindow(_ w: NSWindow?) -> Bool { w != nil && (w === window || remoteScreens.contains { $0.window === w }) }
-    func sendInput(_ m: InputMessage) { if let data = try? JSONEncoder().encode(m) { outbound?.send(Data([2]) + data) } }
+    func sendInput(_ m: InputMessage) {
+        if m.kind == .release { heldEdgeKeys.removeAll() }
+        if let data = try? JSONEncoder().encode(m) { outbound?.send(Data([2]) + data) }
+    }
     func refreshHostState() {
         hostButton.title = hosting ? "공유 중지" : "공유 시작"
         allowAccess.state = hosting ? .on : .off
@@ -585,8 +599,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     func presentScreens() {
         guard inSession, !remoteScreens.isEmpty else { presentWindow(); return }
-        edgeReturn = StreamQualityPreferences.load().edgeReturn
-        presentation = .screens; localPortal = nil; edgePressure = nil
+        let prefs = StreamQualityPreferences.load()
+        edgeReturn = prefs.edgeReturn; remoteSide = prefs.remoteSide
+        presentation = .screens; localPortal = nil; edgePressure = nil; heldEdgeKeys.removeAll()
         window.orderOut(nil)
         if NSApp.isHidden { NSApp.unhide(nil) }
         NSApp.activate(ignoringOtherApps: true)
@@ -610,18 +625,21 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
         for rs in remoteScreens { rs.window.orderOut(nil); rs.viewer.format = nil }
         NSApp.presentationOptions = []
     }
+    func land(on key: EdgePressure.Key, y: CGFloat) -> CGPoint {
+        let f = clientScreens[key.screen].frame
+        let p = CGPoint(x: key.side == .left ? f.minX + 4 : f.maxX - 5, y: min(max(y, f.minY + 1), f.maxY - 1))
+        CGWarpMouseCursorPosition(CGPoint(x: p.x, y: (NSScreen.screens.first?.frame.maxY ?? f.maxY) - p.y))
+        CGAssociateMouseAndMouseCursorPosition(1)
+        return p
+    }
     func goLocal(_ key: EdgePressure.Key, at point: NSPoint) {
+        guard let landing = key.side.opposite.outerScreen(clientScreens.map(\.frame), y: point.y) else { return }
         sendInput(InputMessage(kind: .release))
-        presentation = .local; localPortal = key
+        presentation = .local; localPortal = landing; reentry = PortalReentry()
         NSCursor.arrow.set()
         hideScreens()
         updateSystemInput()
-        if clientScreens.indices.contains(key.screen) {
-            let f = clientScreens[key.screen].frame, top = NSScreen.screens.first?.frame.maxY ?? f.maxY
-            let x = key.side == .left ? f.minX + 4 : f.maxX - 5
-            CGWarpMouseCursorPosition(CGPoint(x: x, y: top - min(max(point.y, f.minY + 1), f.maxY - 1)))
-            CGAssociateMouseAndMouseCursorPosition(1)
-        }
+        _ = land(on: landing, y: point.y)
         // Hiding hands keyboard focus to the app underneath. The edge surface sets canHide = false.
         NSApp.hide(nil)
     }
@@ -705,8 +723,9 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
             m.screen = rs.id
             sendInput(m)
         }
-        if e.type == .mouseMoved, edgeReturn, NSEvent.pressedMouseButtons == 0,
-           let side = portalEdge(screens: clientScreens.map(\.frame), index: rs.id, point: global, dx: e.deltaX) {
+        if e.type == .mouseMoved, edgeReturn, !blocksEdge(e),
+           let side = portalEdge(screens: clientScreens.map(\.frame), index: rs.id, point: global, dx: e.deltaX),
+           side == remoteSide.opposite, side.outerScreen(clientScreens.map(\.frame), y: global.y)?.screen == rs.id {
             advanceEdge(EdgePressure.Key(screen: rs.id, side: side), point: global, now: e.timestamp, distance: abs(e.deltaX))
         } else {
             advanceEdge(nil, point: global, now: e.timestamp)
@@ -735,15 +754,25 @@ final class App: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func localEdge(_ e: NSEvent) {
         guard presentation == .local, inSession, let key = localPortal else { return }
         let global = NSEvent.mouseLocation
-        let side = edgeReturn && NSEvent.pressedMouseButtons == 0 && outbound?.ready == true
-            ? portalEdge(screens: clientScreens.map(\.frame), index: key.screen, point: global, dx: e.deltaX) : nil
-        advanceEdge(side == key.side ? key : nil, point: global, now: e.timestamp, distance: abs(e.deltaX))
+        if reentry.crosses(key, screens: clientScreens.map(\.frame), point: global, dx: e.deltaX,
+                           blocked: !edgeReturn || blocksEdge(e) || outbound?.ready != true),
+           key.side.outerScreen(clientScreens.map(\.frame), y: global.y) == key,
+           let target = key.side.opposite.outerScreen(clientScreens.map(\.frame), y: global.y),
+           let rs = remoteScreens.first(where: { $0.id == target.screen }) {
+            let landed = land(on: target, y: global.y)
+            presentScreens()
+            let r = rs.viewer.contentRect
+            if r.width > 0, r.height > 0 {
+                let p = rs.viewer.convert(rs.window.convertPoint(fromScreen: landed), from: nil)
+                var m = Viewer.inputMessage(e, .move, point: p, rect: r); m.screen = rs.id; sendInput(m)
+            }
+        }
     }
     func advanceEdge(_ key: EdgePressure.Key?, point: NSPoint, now: Double, distance: Double = 0) {
         let had = edgePressure != nil
         if EdgePressure.advance(&edgePressure, key: key, now: now, distance: distance), let key {
             edgeOverlay.release(crossed: true)
-            if presentation == .local { presentScreens() } else { goLocal(key, at: point) }
+            goLocal(key, at: point)
         } else if let p = edgePressure, clientScreens.indices.contains(p.key.screen) {
             edgeOverlay.push(key: p.key, screenFrame: clientScreens[p.key.screen].frame, point: point, distance: p.distance)
         } else if had {

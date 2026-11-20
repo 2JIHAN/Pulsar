@@ -885,6 +885,16 @@ func multiScreenTests() throws {
             && portalEdge(screens: pair, index: 0, point: CGPoint(x: 0, y: 500), dx: 0) == nil && portalEdge(screens: pair, index: 5, point: .zero, dx: -1) == nil, "inward, interior, zero and bad index")
     print("PASS portal edges: only left/right edges without a neighbouring screen at that height")
 
+    var entry = PortalReentry()
+    func enters(_ x: Double, _ dx: Double, blocked: Bool = false, y: Double = 500) -> Bool {
+        entry.crosses(key, screens: pair, point: CGPoint(x: x, y: y), dx: dx, blocked: blocked)
+    }
+    require(!enters(4, 0) && !enters(0, -4), "warp and residual outward movement do not reenter")
+    require(!enters(4, 2) && !enters(0, -3, blocked: true) && !enters(0, -3), "held input clears arming")
+    require(!enters(4, 2) && !enters(0, -2, y: 1000) && !enters(0, -2), "another screen cannot reenter")
+    require(!enters(4, 2) && enters(0, -3) && !enters(0, -3), "one deliberate reentry, no second dwell")
+    print("PASS reentry: no bounce after warp, same-screen bounds, blocked input, immediate outward crossing after rearming")
+
     let D = EdgeSurfaceGeometry.maximumDepth
     require(EdgeSurfaceGeometry.stretch(0) == 0 && EdgeSurfaceGeometry.stretch(-5) == 0 && EdgeSurfaceGeometry.stretch(.nan) == 0, "no push, no stretch")
     require(abs(EdgeSurfaceGeometry.stretch(10) - (10 * D * 1.5 / (D + 15)) / (D - 1)) < 1e-12, "f(u) = u*D*1.5/(D+1.5u)")
@@ -903,12 +913,9 @@ func multiScreenTests() throws {
     require(turned.animation(key: "transform.scale.x").values?.count == Int((EdgeSurfaceSpring.duration * 1.2 * 120).rounded()) + 1, "release animation sampled at 120 Hz for 0.65 s x 1.2")
 
     _ = NSApplication.shared
-    let off = EdgeSurfaceOverlay()
-    off.push(key: key, screenFrame: screen, point: CGPoint(x: -30_000, y: -29_500), distance: 12)
-    off.release(crossed: true)
-    require(!EdgeSurface.enabled && !off.enabled && off.panel == nil && off.depthSpring == nil, "edge surface disabled: pushing shows no panel")
-    print("PASS edge surface disabled by EdgeSurface.enabled = false: push/release show nothing; the 250 ms gate above is unchanged")
-    let overlay = EdgeSurfaceOverlay(); overlay.enabled = true
+    require(EdgeSide.left.outerScreen(pair, y: 500)?.screen == 0 && EdgeSide.right.outerScreen(pair, y: 500)?.screen == 1, "opposite group ends")
+    require(EdgeSide.left.outerScreen(pair, y: 1000)?.screen == 1 && EdgeSide.right.outerScreen(pair, y: 1080) == nil, "staggered and absent rows")
+    let overlay = EdgeSurfaceOverlay()
     overlay.reducedMotion = { true }
     overlay.push(key: key, screenFrame: screen, point: CGPoint(x: -30_000, y: -29_500), distance: 12)
     require(overlay.depthSpring == nil && overlay.panel?.ignoresMouseEvents == true && overlay.panel?.canBecomeKey == false && overlay.panel?.canHide == false
@@ -923,6 +930,10 @@ func multiScreenTests() throws {
 
     let suite = "com.tamcut.Pulsar.layouttest.\(UUID().uuidString)", d = UserDefaults(suiteName: suite)!
     defer { d.removePersistentDomain(forName: suite) }
+    var placement = StreamQualityPreferences.load(d)
+    require(placement.remoteSide == .right, "default remote on right")
+    placement.remoteSide = .left; placement.save(d)
+    require(StreamQualityPreferences.load(d).remoteSide == .left, "left placement saved")
     let layout = [cs(0, main: true, x: 0), cs(1, x: 1512, w: 1920, h: 1080)]
     require(ScreenLayoutMemory.load(host: "mac-mini", screens: layout, d).isEmpty, "nothing saved yet")
     ScreenLayoutMemory.save(host: "mac-mini", screens: layout, choices: [0: "B", 1: "virtual"], d)

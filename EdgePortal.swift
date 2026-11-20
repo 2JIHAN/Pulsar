@@ -4,7 +4,14 @@ import QuartzCore
 // Ported from ThunderControl (return-edge-resistance-20261110): DesktopReturnPressure,
 // ReturnBoundaryGeometry/Spring/Overlay. Only left and right outer edges are portals, so the
 // geometry keeps the two vertical cases and works directly in Cocoa screen points.
-enum EdgeSide: Equatable { case left, right }
+enum EdgeSide: String { case left, right
+    var opposite: Self { self == .left ? .right : .left }
+    func outerScreen(_ screens: [CGRect], y: CGFloat) -> EdgePressure.Key? {
+        let row = screens.indices.filter { screens[$0].minY <= y && y < screens[$0].maxY }
+        let i = row.min { a, b in self == .left ? screens[a].minX < screens[b].minX : screens[a].maxX > screens[b].maxX }
+        return i.map { EdgePressure.Key(screen: $0, side: self) }
+    }
+}
 
 struct EdgePressure: Equatable {
     struct Key: Equatable { let screen: Int; let side: EdgeSide }
@@ -33,6 +40,7 @@ struct EdgePressure: Equatable {
 func portalEdge(screens: [CGRect], index: Int, point: CGPoint, dx: Double) -> EdgeSide? {
     guard screens.indices.contains(index), dx.isFinite, dx != 0 else { return nil }
     let f = screens[index]
+    guard f.contains(point) else { return nil }
     let side: EdgeSide
     if dx < 0, point.x <= f.minX + 1 { side = .left }
     else if dx > 0, point.x >= f.maxX - 1.5 { side = .right }
@@ -44,7 +52,21 @@ func portalEdge(screens: [CGRect], index: Int, point: CGPoint, dx: Double) -> Ed
     return neighbour ? nil : side
 }
 
+// A landing warp or continued pushing must not send the user straight back.
+struct PortalReentry {
+    private var armed = false
+    mutating func crosses(_ key: EdgePressure.Key, screens: [CGRect], point: CGPoint, dx: Double, blocked: Bool) -> Bool {
+        guard !blocked, screens.indices.contains(key.screen), screens[key.screen].contains(point), dx.isFinite else { armed = false; return false }
+        let f = screens[key.screen]
+        let inset = key.side == .left ? point.x - f.minX : (f.maxX - 1) - point.x
+        if inset >= 2, key.side == .left ? dx > 0 : dx < 0 { armed = true }
+        guard armed, portalEdge(screens: screens, index: key.screen, point: point, dx: dx) == key.side else { return false }
+        armed = false; return true
+    }
+}
+
 struct EdgeSurfaceGeometry {
+
     static let maximumDepth = 26.0
     static let maximumLength: CGFloat = 140
     let frame: CGRect
@@ -128,13 +150,9 @@ final class EdgeSurfacePanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-// 0.11: the grey rubber band is off. The 0.25 s edge-return gate (EdgePressure) still decides crossings;
-// set this to true to show the surface again.
-enum EdgeSurface { static let enabled = false }
 
 // Opaque grey (.92) surface on the pushed edge, click-through and never key.
 final class EdgeSurfaceOverlay {
-    var enabled = EdgeSurface.enabled
     private(set) var panel: EdgeSurfacePanel?
     private(set) var membrane: CAShapeLayer?
     private var key: EdgePressure.Key?
@@ -146,7 +164,6 @@ final class EdgeSurfaceOverlay {
     var reducedMotion: () -> Bool = { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 
     func push(key: EdgePressure.Key, screenFrame frame: CGRect, point: CGPoint, distance: Double) {
-        guard enabled else { return }
         dismissal?.cancel(); dismissal = nil
         let isNew = self.key != key || panel == nil || screenFrame != frame
         if isNew {
