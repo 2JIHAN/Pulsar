@@ -2,7 +2,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 APP=build/Pulsar.app
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp Resources/Pulsar.icns "$APP/Contents/Resources/Pulsar.icns"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -10,9 +11,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleExecutable</key><string>Pulsar</string>
 <key>CFBundleIdentifier</key><string>com.tamcut.Pulsar</string>
 <key>CFBundleName</key><string>Pulsar</string>
+<key>CFBundleIconFile</key><string>Pulsar.icns</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>0.17.0</string>
-<key>CFBundleVersion</key><string>38</string>
+<key>CFBundleShortVersionString</key><string>0.17.1</string>
+<key>CFBundleVersion</key><string>39</string>
 <key>LSMinimumSystemVersion</key><string>14.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSLocalNetworkUsageDescription</key><string>선택한 Mac과 암호화된 화면 및 입력 연결을 만듭니다.</string>
